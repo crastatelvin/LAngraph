@@ -19,6 +19,7 @@ from apps.api.metrics import WorkflowMetricsStore
 from apps.api.request_metrics import EndpointMetricsStore
 from apps.api.models import DebateModel
 from apps.api.store import DebateStore
+from apps.api.slack import SlackIntegration
 from apps.api.telemetry import setup_telemetry
 from packages.schemas.debate import (
     DebateApproveResponse,
@@ -42,6 +43,7 @@ workflow_metrics_store = WorkflowMetricsStore()
 endpoint_metrics_store = EndpointMetricsStore()
 logger = logging.getLogger("api.requests")
 tracer = trace.get_tracer("ai-parliament-api")
+slack_integration = SlackIntegration()
 rate_limit_store: dict[str, list[float]] = {}
 MAX_REQUESTS_PER_MINUTE = int(os.getenv("MAX_REQUESTS_PER_MINUTE", "240"))
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", "16384"))
@@ -234,3 +236,26 @@ def stream_debate_events(
         time.sleep(0.1)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@app.post("/v1/integrations/slack/events")
+async def slack_events(request: Request) -> JSONResponse:
+    if not slack_integration.enabled():
+        return JSONResponse(status_code=503, content={"detail": "Slack integration disabled"})
+
+    body = await request.body()
+    signature = request.headers.get("X-Slack-Signature")
+    timestamp = request.headers.get("X-Slack-Request-Timestamp")
+    if not slack_integration.verify_signature(timestamp, signature, body):
+        return JSONResponse(status_code=401, content={"detail": "Invalid Slack signature"})
+
+    payload = slack_integration.parse_body(body)
+    if "challenge" in payload:
+        return JSONResponse(status_code=200, content={"challenge": payload["challenge"]})
+
+    event_id = payload.get("event_id")
+    if slack_integration.is_duplicate(event_id):
+        return JSONResponse(status_code=200, content={"status": "duplicate_ignored"})
+
+    event_type = payload.get("event", {}).get("type", "unknown")
+    return JSONResponse(status_code=200, content={"status": "accepted", "event_type": event_type})
