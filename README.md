@@ -33,9 +33,14 @@ docs/
 
 1. Create a virtual environment and install dependencies:
    - `pip install -r apps/api/requirements.txt`
-2. Start API:
+2. Copy env template:
+   - `cp .env.example .env` (Linux/macOS)
+   - `copy .env.example .env` (Windows CMD)
+   - `Copy-Item .env.example .env` (PowerShell)
+3. Update `.env` values as needed (especially Slack secrets if using integrations).
+4. Start API:
    - `uvicorn apps.api.main:app --reload --port 8000`
-3. Verify:
+5. Verify:
    - `GET http://localhost:8000/health`
 
 ## Quickstart (Slack Worker)
@@ -50,6 +55,9 @@ Run API + worker together:
 
 API endpoint:
 - `http://localhost:8000/health`
+
+You can also pass env values to Compose via:
+- `docker compose --env-file .env up --build`
 
 ## Developer Shortcuts (Makefile)
 

@@ -18,6 +18,7 @@ Thumbs.db
 # Env and secrets
 .env
 .env.*
+!.env.example
 
 # Build artifacts
 dist/
