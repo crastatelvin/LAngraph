@@ -1,9 +1,16 @@
 from dataclasses import asdict
+from contextlib import asynccontextmanager
+import json
+import time
 
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
 
 from apps.api.audit import AuditStore
 from apps.api.context import RequestContext, get_request_context
+from apps.api.db import Base, engine, get_db
+from apps.api.models import DebateModel
 from apps.api.store import DebateStore
 from packages.schemas.debate import (
     DebateApproveResponse,
@@ -13,7 +20,13 @@ from packages.schemas.debate import (
     DebateRecord,
 )
 
-app = FastAPI(title="AI Parliament API", version="0.1.0")
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    Base.metadata.create_all(bind=engine)
+    yield
+
+
+app = FastAPI(title="AI Parliament API", version="0.1.0", lifespan=lifespan)
 store = DebateStore()
 audit_store = AuditStore()
 
@@ -27,9 +40,11 @@ def health() -> dict[str, str]:
 def create_debate(
     payload: DebateCreateRequest,
     ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
 ) -> DebateCreateResponse:
-    record = store.create(payload.proposal, tenant_id=ctx.tenant_id)
+    record = store.create(db, payload.proposal, tenant_id=ctx.tenant_id)
     audit_store.append(
+        db=db,
         tenant_id=ctx.tenant_id,
         actor_id=ctx.user_id,
         action="debate.create",
@@ -47,11 +62,13 @@ def create_debate(
 def get_debate(
     debate_id: str,
     ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
 ) -> DebateRecord:
-    record = store.get(debate_id, tenant_id=ctx.tenant_id)
+    record = store.get(db, debate_id, tenant_id=ctx.tenant_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Debate not found")
     audit_store.append(
+        db=db,
         tenant_id=ctx.tenant_id,
         actor_id=ctx.user_id,
         action="debate.read",
@@ -65,11 +82,13 @@ def get_debate(
 def get_debate_events(
     debate_id: str,
     ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
 ) -> DebateEventsResponse:
-    events = store.get_events(debate_id, tenant_id=ctx.tenant_id)
+    events = store.get_events(db, debate_id, tenant_id=ctx.tenant_id)
     if events is None:
         raise HTTPException(status_code=404, detail="Debate not found")
     audit_store.append(
+        db=db,
         tenant_id=ctx.tenant_id,
         actor_id=ctx.user_id,
         action="debate.events.read",
@@ -83,11 +102,13 @@ def get_debate_events(
 def approve_debate(
     debate_id: str,
     ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
 ) -> DebateApproveResponse:
-    record = store.approve(debate_id, tenant_id=ctx.tenant_id)
+    record = store.approve(db, debate_id, tenant_id=ctx.tenant_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Debate not found")
     audit_store.append(
+        db=db,
         tenant_id=ctx.tenant_id,
         actor_id=ctx.user_id,
         action="debate.approve",
@@ -98,5 +119,32 @@ def approve_debate(
 
 
 @app.get("/v1/admin/audit")
-def get_audit_events(ctx: RequestContext = Depends(get_request_context)) -> list[dict]:
-    return [asdict(event) for event in audit_store.list_for_tenant(ctx.tenant_id)]
+def get_audit_events(
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    return [asdict(event) for event in audit_store.list_for_tenant(db, ctx.tenant_id)]
+
+
+@app.get("/v1/debates/{debate_id}/stream")
+def stream_debate_events(
+    debate_id: str,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    debate_exists = (
+        db.query(DebateModel)
+        .filter(DebateModel.debate_id == debate_id, DebateModel.tenant_id == ctx.tenant_id)
+        .first()
+    )
+    if debate_exists is None:
+        raise HTTPException(status_code=404, detail="Debate not found")
+
+    def event_generator() -> str:
+        events = store.get_events(db, debate_id, tenant_id=ctx.tenant_id) or []
+        for event in events:
+            yield f"data: {json.dumps(event.model_dump())}\n\n"
+        # keep stream briefly alive for client compatibility
+        time.sleep(0.1)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
