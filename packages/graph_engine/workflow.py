@@ -1,5 +1,7 @@
 from typing import TypedDict
 
+from langgraph.graph import END, START, StateGraph
+
 
 class DebateWorkflowState(TypedDict):
     proposal: str
@@ -30,8 +32,14 @@ def generate_initial_report(state: DebateWorkflowState) -> DebateWorkflowState:
 
 
 def run_debate_workflow(proposal: str) -> DebateWorkflowState:
-    # LangGraph-style node pipeline scaffold; replace with StateGraph in Phase 1 completion.
-    state: DebateWorkflowState = {"proposal": proposal, "status": "created", "events": []}
-    state = normalize_proposal(state)
-    state = generate_initial_report(state)
-    return state
+    graph = StateGraph(DebateWorkflowState)
+    graph.add_node("normalize_proposal", normalize_proposal)
+    graph.add_node("generate_initial_report", generate_initial_report)
+    graph.add_edge(START, "normalize_proposal")
+    graph.add_edge("normalize_proposal", "generate_initial_report")
+    graph.add_edge("generate_initial_report", END)
+
+    app = graph.compile()
+    initial: DebateWorkflowState = {"proposal": proposal, "status": "created", "events": []}
+    result = app.invoke(initial)
+    return result

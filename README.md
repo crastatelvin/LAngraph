@@ -38,6 +38,13 @@ docs/
 3. Verify:
    - `GET http://localhost:8000/health`
 
+## Database Migrations
+
+- Create/update DB schema with Alembic:
+  - `alembic upgrade head`
+- Create new migration:
+  - `alembic revision -m "your_message"`
+
 ## Collaboration
 
 Please read:

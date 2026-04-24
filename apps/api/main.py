@@ -8,7 +8,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from apps.api.audit import AuditStore
-from apps.api.context import RequestContext, get_request_context
+from apps.api.context import RequestContext, get_request_context, require_roles
 from apps.api.db import Base, engine, get_db
 from apps.api.models import DebateModel
 from apps.api.store import DebateStore
@@ -104,6 +104,7 @@ def approve_debate(
     ctx: RequestContext = Depends(get_request_context),
     db: Session = Depends(get_db),
 ) -> DebateApproveResponse:
+    require_roles(ctx, {"admin", "owner"})
     record = store.approve(db, debate_id, tenant_id=ctx.tenant_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Debate not found")
@@ -123,6 +124,7 @@ def get_audit_events(
     ctx: RequestContext = Depends(get_request_context),
     db: Session = Depends(get_db),
 ) -> list[dict]:
+    require_roles(ctx, {"admin", "owner"})
     return [asdict(event) for event in audit_store.list_for_tenant(db, ctx.tenant_id)]
 
 

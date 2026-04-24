@@ -14,6 +14,11 @@ HEADERS = {
     "X-User-Id": "user-1",
     "X-User-Role": "admin",
 }
+MEMBER_HEADERS = {
+    "X-Tenant-Id": "tenant-alpha",
+    "X-User-Id": "user-2",
+    "X-User-Role": "member",
+}
 
 
 def test_debate_lifecycle() -> None:
@@ -63,6 +68,22 @@ def test_missing_context_headers() -> None:
     with TestClient(app) as client:
         response = client.post("/v1/debates", json={"proposal": "Missing context should fail"})
         assert response.status_code == 400
+
+
+def test_role_restrictions_on_admin_actions() -> None:
+    with TestClient(app) as client:
+        created = client.post(
+            "/v1/debates",
+            json={"proposal": "Require admin for approval"},
+            headers=HEADERS,
+        ).json()
+        debate_id = created["debate_id"]
+
+        approve_resp = client.post(f"/v1/debates/{debate_id}/approve", headers=MEMBER_HEADERS)
+        assert approve_resp.status_code == 403
+
+        audit_resp = client.get("/v1/admin/audit", headers=MEMBER_HEADERS)
+        assert audit_resp.status_code == 403
 
 
 def test_debate_stream_sse() -> None:
