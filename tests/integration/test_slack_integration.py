@@ -13,6 +13,8 @@ if str(ROOT) not in sys.path:
 
 import apps.api.main as api_main
 from apps.api.main import app
+from apps.api.db import SessionLocal
+from apps.api.models import SlackInboundEventModel, SlackOutboundMessageModel, SlackSentDedupeModel
 
 
 def _sign(secret: str, body: str, timestamp: str) -> str:
@@ -59,7 +61,10 @@ def test_slack_idempotency_duplicate_ignored() -> None:
         old_secret = api_main.os.getenv("SLACK_SIGNING_SECRET")
         api_main.os.environ["ENABLE_SLACK_INTEGRATION"] = "true"
         api_main.os.environ["SLACK_SIGNING_SECRET"] = "test-secret"
-        api_main.slack_integration._seen_event_ids.clear()
+        db = SessionLocal()
+        db.query(SlackInboundEventModel).delete()
+        db.commit()
+        db.close()
         try:
             payload = {"event_id": "evt-1", "event": {"type": "message"}}
             body = json.dumps(payload)
@@ -159,8 +164,11 @@ def test_slack_outbound_flush_retry_safe() -> None:
         api_main.os.environ["ENABLE_SLACK_INTEGRATION"] = "true"
         api_main.os.environ["SLACK_SIGNING_SECRET"] = "test-secret"
         api_main.os.environ["SLACK_BOT_TOKEN"] = "xoxb-test"
-        api_main.slack_integration._outbound_queue.clear()
-        api_main.slack_integration._sent_dedupe_keys.clear()
+        db = SessionLocal()
+        db.query(SlackOutboundMessageModel).delete()
+        db.query(SlackSentDedupeModel).delete()
+        db.commit()
+        db.close()
         sent_calls: list[tuple[str, str]] = []
 
         def fake_send(token: str, channel: str, text: str, thread_ts: str | None = None) -> bool:
@@ -170,9 +178,11 @@ def test_slack_outbound_flush_retry_safe() -> None:
         original_sender = api_main.slack_integration._send_chat_post_message
         api_main.slack_integration._send_chat_post_message = fake_send
         try:
+            db = SessionLocal()
             api_main.slack_integration.queue_thread_message(
-                channel="C999", text="Hello thread", dedupe_key="d1"
+                db=db, channel="C999", text="Hello thread", dedupe_key="d1"
             )
+            db.close()
             status_headers = {
                 "X-Tenant-Id": "tenant-int-001",
                 "X-User-Id": "user-1",
@@ -184,9 +194,11 @@ def test_slack_outbound_flush_retry_safe() -> None:
             assert len(sent_calls) == 1
 
             # Deduped message should not enqueue again.
+            db = SessionLocal()
             enqueued = api_main.slack_integration.queue_thread_message(
-                channel="C999", text="Hello thread", dedupe_key="d1"
+                db=db, channel="C999", text="Hello thread", dedupe_key="d1"
             )
+            db.close()
             assert enqueued is False
         finally:
             api_main.slack_integration._send_chat_post_message = original_sender

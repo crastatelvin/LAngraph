@@ -239,7 +239,7 @@ def stream_debate_events(
 
 
 @app.post("/v1/integrations/slack/events")
-async def slack_events(request: Request) -> JSONResponse:
+async def slack_events(request: Request, db: Session = Depends(get_db)) -> JSONResponse:
     if not slack_integration.enabled():
         return JSONResponse(status_code=503, content={"detail": "Slack integration disabled"})
 
@@ -254,7 +254,7 @@ async def slack_events(request: Request) -> JSONResponse:
         return JSONResponse(status_code=200, content={"challenge": payload["challenge"]})
 
     event_id = payload.get("event_id")
-    if slack_integration.is_duplicate(event_id):
+    if slack_integration.is_duplicate(db, event_id):
         return JSONResponse(status_code=200, content={"status": "duplicate_ignored"})
 
     event_type = payload.get("event", {}).get("type", "unknown")
@@ -306,6 +306,7 @@ async def slack_commands(request: Request, db: Session = Depends(get_db)) -> JSO
     channel_id = form.get("channel_id", "")
     if channel_id:
         slack_integration.queue_thread_message(
+            db=db,
             channel=channel_id,
             text=f"Debate `{record.debate_id}` queued. Proposal: {record.proposal}",
             dedupe_key=f"debate-created:{record.debate_id}",
@@ -320,12 +321,18 @@ async def slack_commands(request: Request, db: Session = Depends(get_db)) -> JSO
 
 
 @app.get("/v1/integrations/slack/outbound/status")
-def slack_outbound_status(ctx: RequestContext = Depends(get_request_context)) -> dict:
+def slack_outbound_status(
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> dict:
     require_roles(ctx, {"admin", "owner"})
-    return slack_integration.outbound_status()
+    return slack_integration.outbound_status(db)
 
 
 @app.post("/v1/integrations/slack/outbound/flush")
-def slack_outbound_flush(ctx: RequestContext = Depends(get_request_context)) -> dict:
+def slack_outbound_flush(
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> dict:
     require_roles(ctx, {"admin", "owner"})
-    return slack_integration.flush_outbound_queue()
+    return slack_integration.flush_outbound_queue(db)

@@ -35,3 +35,32 @@ class AuditEventModel(Base):
     payload_json: Mapped[str] = mapped_column(Text())
     timestamp: Mapped[str] = mapped_column(String(64))
 
+
+class SlackInboundEventModel(Base):
+    __tablename__ = "slack_inbound_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    seen_at: Mapped[str] = mapped_column(String(64))
+
+
+class SlackSentDedupeModel(Base):
+    __tablename__ = "slack_sent_dedupes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    dedupe_key: Mapped[str] = mapped_column(String(256), unique=True, index=True)
+    sent_at: Mapped[str] = mapped_column(String(64))
+
+
+class SlackOutboundMessageModel(Base):
+    __tablename__ = "slack_outbound_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    channel: Mapped[str] = mapped_column(String(128), index=True)
+    text: Mapped[str] = mapped_column(Text())
+    thread_ts: Mapped[str] = mapped_column(String(64), nullable=True)
+    dedupe_key: Mapped[str] = mapped_column(String(256), nullable=True, index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    created_at: Mapped[str] = mapped_column(String(64))
+
