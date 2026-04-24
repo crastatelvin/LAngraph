@@ -17,7 +17,7 @@ from apps.api.context import RequestContext, get_request_context, require_roles
 from apps.api.db import Base, engine, get_db
 from apps.api.metrics import WorkflowMetricsStore
 from apps.api.request_metrics import EndpointMetricsStore
-from apps.api.models import DebateModel
+from apps.api.models import DebateModel, SlackOutboundMessageModel
 from apps.api.store import DebateStore
 from apps.api.slack import SlackIntegration
 from apps.api.telemetry import setup_telemetry
@@ -211,6 +211,43 @@ def get_metrics(ctx: RequestContext = Depends(get_request_context)) -> dict:
     return {
         "workflow": workflow_metrics_store.snapshot(),
         "endpoints": endpoint_metrics_store.snapshot(),
+    }
+
+
+@app.get("/v1/admin/slo")
+def get_slo(
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> dict:
+    require_roles(ctx, {"admin", "owner"})
+    workflow = workflow_metrics_store.snapshot()
+    endpoints = endpoint_metrics_store.snapshot()
+    queued = (
+        db.query(SlackOutboundMessageModel)
+        .filter(SlackOutboundMessageModel.status.in_(["queued", "retry"]))
+        .count()
+    )
+    failed = (
+        db.query(SlackOutboundMessageModel)
+        .filter(SlackOutboundMessageModel.status == "failed")
+        .count()
+    )
+    fallback_rate = 0.0
+    if workflow["total_runs"] > 0:
+        fallback_rate = round(workflow["fallback_count"] / workflow["total_runs"], 4)
+    return {
+        "slo_targets": {
+            "api_non_llm_p95_ms_target": 700,
+            "debate_completion_target_s": 60,
+        },
+        "observed": {
+            "workflow_avg_latency_ms": workflow["avg_workflow_latency_ms"],
+            "workflow_fallback_rate": fallback_rate,
+            "workflow_parse_failures": workflow["parse_failure_count"],
+            "endpoint_count": len(endpoints),
+            "slack_queue_depth": queued,
+            "slack_failed_messages": failed,
+        },
     }
 
 

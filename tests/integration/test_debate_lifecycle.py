@@ -93,6 +93,8 @@ def test_role_restrictions_on_admin_actions() -> None:
         assert audit_resp.status_code == 403
         metrics_resp = client.get("/v1/admin/metrics", headers=MEMBER_HEADERS)
         assert metrics_resp.status_code == 403
+        slo_resp = client.get("/v1/admin/slo", headers=MEMBER_HEADERS)
+        assert slo_resp.status_code == 403
 
 
 def test_debate_stream_sse() -> None:
@@ -123,6 +125,13 @@ def test_workflow_parse_fallback_event() -> None:
         metrics = client.get("/v1/admin/metrics", headers=HEADERS).json()
         assert metrics["workflow"]["fallback_count"] >= 1
         assert "POST /v1/debates" in metrics["endpoints"]
+
+        slo = client.get("/v1/admin/slo", headers=HEADERS)
+        assert slo.status_code == 200
+        payload = slo.json()
+        assert "observed" in payload
+        assert "workflow_avg_latency_ms" in payload["observed"]
+        assert "slack_queue_depth" in payload["observed"]
 
 
 def test_security_headers_present() -> None:
