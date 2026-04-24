@@ -38,6 +38,11 @@ docs/
 3. Verify:
    - `GET http://localhost:8000/health`
 
+## Quickstart (Slack Worker)
+
+Run outbound Slack queue worker:
+- `python -m apps.worker.slack_outbound_worker`
+
 ## Database Migrations
 
 - Create/update DB schema with Alembic:
