@@ -1,4 +1,5 @@
 import json
+import time
 from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -9,6 +10,13 @@ class DebateWorkflowState(TypedDict):
     proposal: str
     status: str
     events: list[dict]
+    parse_failures: int
+    fallback_used: bool
+
+
+class DebateWorkflowResult(TypedDict):
+    state: dict
+    metrics: dict
 
 
 class DecisionReport(BaseModel):
@@ -17,12 +25,14 @@ class DecisionReport(BaseModel):
     note: str
 
 
-def _parse_report_with_retry(outputs: list[str]) -> tuple[DecisionReport, bool]:
+def _parse_report_with_retry(outputs: list[str]) -> tuple[DecisionReport, bool, int]:
+    parse_failures = 0
     for idx, raw in enumerate(outputs):
         try:
             parsed = DecisionReport.model_validate(json.loads(raw))
-            return parsed, idx > 0
+            return parsed, idx > 0, parse_failures
         except (json.JSONDecodeError, ValidationError):
+            parse_failures += 1
             continue
     # Safe fallback if all attempts fail.
     return (
@@ -32,6 +42,7 @@ def _parse_report_with_retry(outputs: list[str]) -> tuple[DecisionReport, bool]:
             note="Unable to parse model output. Marked inconclusive.",
         ),
         True,
+        parse_failures,
     )
 
 
@@ -61,9 +72,11 @@ def generate_initial_report(state: DebateWorkflowState) -> DebateWorkflowState:
             "note": "Fallback report applied after parse failure.",
         }
     )
-    report, used_fallback = _parse_report_with_retry([primary_output, fallback_output])
+    report, used_fallback, parse_failures = _parse_report_with_retry([primary_output, fallback_output])
 
     state["status"] = "created"
+    state["parse_failures"] = parse_failures
+    state["fallback_used"] = used_fallback
     if used_fallback:
         state["events"].append(
             {
@@ -80,7 +93,8 @@ def generate_initial_report(state: DebateWorkflowState) -> DebateWorkflowState:
     return state
 
 
-def run_debate_workflow(proposal: str) -> DebateWorkflowState:
+def run_debate_workflow(proposal: str) -> DebateWorkflowResult:
+    started = time.perf_counter()
     graph = StateGraph(DebateWorkflowState)
     graph.add_node("normalize_proposal", normalize_proposal)
     graph.add_node("generate_initial_report", generate_initial_report)
@@ -89,6 +103,24 @@ def run_debate_workflow(proposal: str) -> DebateWorkflowState:
     graph.add_edge("generate_initial_report", END)
 
     app = graph.compile()
-    initial: DebateWorkflowState = {"proposal": proposal, "status": "created", "events": []}
+    initial: DebateWorkflowState = {
+        "proposal": proposal,
+        "status": "created",
+        "events": [],
+        "parse_failures": 0,
+        "fallback_used": False,
+    }
     result = app.invoke(initial)
-    return result
+    latency_ms = (time.perf_counter() - started) * 1000
+    return {
+        "state": {
+            "proposal": result["proposal"],
+            "status": result["status"],
+            "events": result["events"],
+        },
+        "metrics": {
+            "parse_failures": result["parse_failures"],
+            "fallback_used": result["fallback_used"],
+            "latency_ms": round(latency_ms, 2),
+        },
+    }

@@ -10,14 +10,16 @@ if str(ROOT) not in sys.path:
 from apps.api.main import app
 
 HEADERS = {
-    "X-Tenant-Id": "tenant-alpha",
+    "X-Tenant-Id": "tenant-int-001",
     "X-User-Id": "user-1",
     "X-User-Role": "admin",
+    "X-Request-Id": "req-test-001",
 }
 MEMBER_HEADERS = {
-    "X-Tenant-Id": "tenant-alpha",
+    "X-Tenant-Id": "tenant-int-001",
     "X-User-Id": "user-2",
     "X-User-Role": "member",
+    "X-Request-Id": "req-test-002",
 }
 
 
@@ -42,6 +44,7 @@ def test_debate_lifecycle() -> None:
         events = events_resp.json()["events"]
         assert len(events) >= 2
         assert events[0]["event_type"] == "debate_created"
+        assert events[0]["payload"]["request_id"] == "req-test-001"
 
         approve_resp = client.post(f"/v1/debates/{debate_id}/approve", headers=HEADERS)
         assert approve_resp.status_code == 200
@@ -53,6 +56,9 @@ def test_debate_lifecycle() -> None:
         audit_resp = client.get("/v1/admin/audit", headers=HEADERS)
         assert audit_resp.status_code == 200
         assert len(audit_resp.json()) >= 4
+        assert any(
+            item["payload"].get("request_id") == "req-test-001" for item in audit_resp.json()
+        )
 
 
 def test_not_found_paths() -> None:
@@ -84,6 +90,8 @@ def test_role_restrictions_on_admin_actions() -> None:
 
         audit_resp = client.get("/v1/admin/audit", headers=MEMBER_HEADERS)
         assert audit_resp.status_code == 403
+        metrics_resp = client.get("/v1/admin/metrics", headers=MEMBER_HEADERS)
+        assert metrics_resp.status_code == 403
 
 
 def test_debate_stream_sse() -> None:
@@ -111,3 +119,5 @@ def test_workflow_parse_fallback_event() -> None:
         events = client.get(f"/v1/debates/{debate_id}/events", headers=HEADERS).json()["events"]
         event_types = [event["event_type"] for event in events]
         assert "report_parse_fallback_used" in event_types
+        metrics = client.get("/v1/admin/metrics", headers=HEADERS).json()
+        assert metrics["fallback_count"] >= 1

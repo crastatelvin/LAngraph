@@ -9,9 +9,16 @@ from packages.graph_engine.workflow import run_debate_workflow
 
 
 class DebateStore:
-    def create(self, db: Session, proposal: str, tenant_id: str) -> DebateRecord:
+    def create(
+        self,
+        db: Session,
+        proposal: str,
+        tenant_id: str,
+        request_id: str,
+    ) -> tuple[DebateRecord, dict]:
         debate_id = str(uuid4())
-        workflow = run_debate_workflow(proposal)
+        workflow_result = run_debate_workflow(proposal)
+        workflow = workflow_result["state"]
         record = DebateRecord(
             debate_id=debate_id,
             proposal=workflow["proposal"],
@@ -21,7 +28,11 @@ class DebateStore:
             DebateEvent(
                 seq=1,
                 event_type="debate_created",
-                payload={"proposal": workflow["proposal"], "tenant_id": tenant_id},
+                payload={
+                    "proposal": workflow["proposal"],
+                    "tenant_id": tenant_id,
+                    "request_id": request_id,
+                },
             ),
         ]
         for idx, item in enumerate(workflow["events"], start=2):
@@ -46,7 +57,7 @@ class DebateStore:
                 )
             )
         db.commit()
-        return record
+        return record, workflow_result["metrics"]
 
     def get(self, db: Session, debate_id: str, tenant_id: str) -> DebateRecord | None:
         row = (

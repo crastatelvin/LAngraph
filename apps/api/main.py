@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from apps.api.audit import AuditStore
 from apps.api.context import RequestContext, get_request_context, require_roles
 from apps.api.db import Base, engine, get_db
+from apps.api.metrics import WorkflowMetricsStore
 from apps.api.models import DebateModel
 from apps.api.store import DebateStore
 from packages.schemas.debate import (
@@ -29,6 +30,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="AI Parliament API", version="0.1.0", lifespan=lifespan)
 store = DebateStore()
 audit_store = AuditStore()
+workflow_metrics_store = WorkflowMetricsStore()
 
 
 @app.get("/health")
@@ -42,14 +44,25 @@ def create_debate(
     ctx: RequestContext = Depends(get_request_context),
     db: Session = Depends(get_db),
 ) -> DebateCreateResponse:
-    record = store.create(db, payload.proposal, tenant_id=ctx.tenant_id)
+    record, workflow_metrics = store.create(
+        db,
+        payload.proposal,
+        tenant_id=ctx.tenant_id,
+        request_id=ctx.request_id,
+    )
+    workflow_metrics_store.record_workflow(workflow_metrics)
     audit_store.append(
         db=db,
         tenant_id=ctx.tenant_id,
         actor_id=ctx.user_id,
         action="debate.create",
         resource=f"debates/{record.debate_id}",
-        payload={"proposal": record.proposal, "role": ctx.user_role},
+        payload={
+            "proposal": record.proposal,
+            "role": ctx.user_role,
+            "request_id": ctx.request_id,
+            "workflow_metrics": workflow_metrics,
+        },
     )
     return DebateCreateResponse(
         debate_id=record.debate_id,
@@ -73,7 +86,7 @@ def get_debate(
         actor_id=ctx.user_id,
         action="debate.read",
         resource=f"debates/{debate_id}",
-        payload={"role": ctx.user_role},
+        payload={"role": ctx.user_role, "request_id": ctx.request_id},
     )
     return record
 
@@ -93,7 +106,7 @@ def get_debate_events(
         actor_id=ctx.user_id,
         action="debate.events.read",
         resource=f"debates/{debate_id}/events",
-        payload={"role": ctx.user_role},
+        payload={"role": ctx.user_role, "request_id": ctx.request_id},
     )
     return DebateEventsResponse(debate_id=debate_id, events=events)
 
@@ -114,7 +127,7 @@ def approve_debate(
         actor_id=ctx.user_id,
         action="debate.approve",
         resource=f"debates/{debate_id}",
-        payload={"status": record.status, "role": ctx.user_role},
+        payload={"status": record.status, "role": ctx.user_role, "request_id": ctx.request_id},
     )
     return DebateApproveResponse(debate_id=debate_id, status=record.status)
 
@@ -126,6 +139,12 @@ def get_audit_events(
 ) -> list[dict]:
     require_roles(ctx, {"admin", "owner"})
     return [asdict(event) for event in audit_store.list_for_tenant(db, ctx.tenant_id)]
+
+
+@app.get("/v1/admin/metrics")
+def get_metrics(ctx: RequestContext = Depends(get_request_context)) -> dict:
+    require_roles(ctx, {"admin", "owner"})
+    return workflow_metrics_store.snapshot()
 
 
 @app.get("/v1/debates/{debate_id}/stream")
