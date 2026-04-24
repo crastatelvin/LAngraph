@@ -5,3 +5,5 @@ pytest
 sqlalchemy
 alembic
 langgraph
+opentelemetry-api
+opentelemetry-sdk

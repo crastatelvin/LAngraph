@@ -120,4 +120,5 @@ def test_workflow_parse_fallback_event() -> None:
         event_types = [event["event_type"] for event in events]
         assert "report_parse_fallback_used" in event_types
         metrics = client.get("/v1/admin/metrics", headers=HEADERS).json()
-        assert metrics["fallback_count"] >= 1
+        assert metrics["workflow"]["fallback_count"] >= 1
+        assert "POST /v1/debates" in metrics["endpoints"]

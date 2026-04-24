@@ -1,18 +1,23 @@
 from dataclasses import asdict
 from contextlib import asynccontextmanager
 import json
+import logging
 import time
 
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Request
 from fastapi.responses import StreamingResponse
+from opentelemetry import trace
 from sqlalchemy.orm import Session
 
 from apps.api.audit import AuditStore
 from apps.api.context import RequestContext, get_request_context, require_roles
 from apps.api.db import Base, engine, get_db
 from apps.api.metrics import WorkflowMetricsStore
+from apps.api.request_metrics import EndpointMetricsStore
 from apps.api.models import DebateModel
 from apps.api.store import DebateStore
+from apps.api.telemetry import setup_telemetry
 from packages.schemas.debate import (
     DebateApproveResponse,
     DebateCreateRequest,
@@ -24,6 +29,7 @@ from packages.schemas.debate import (
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
+    setup_telemetry()
     yield
 
 
@@ -31,6 +37,34 @@ app = FastAPI(title="AI Parliament API", version="0.1.0", lifespan=lifespan)
 store = DebateStore()
 audit_store = AuditStore()
 workflow_metrics_store = WorkflowMetricsStore()
+endpoint_metrics_store = EndpointMetricsStore()
+logger = logging.getLogger("api.requests")
+tracer = trace.get_tracer("ai-parliament-api")
+
+
+@app.middleware("http")
+async def observe_requests(request: Request, call_next):
+    started = time.perf_counter()
+    request_id = request.headers.get("X-Request-Id", "missing")
+    route_key = f"{request.method} {request.url.path}"
+    with tracer.start_as_current_span("http.request") as span:
+        span.set_attribute("http.method", request.method)
+        span.set_attribute("http.route", request.url.path)
+        span.set_attribute("request.id", request_id)
+        response = await call_next(request)
+        latency_ms = (time.perf_counter() - started) * 1000
+        endpoint_metrics_store.observe(route_key, latency_ms)
+        span.set_attribute("http.status_code", response.status_code)
+        span.set_attribute("http.latency_ms", round(latency_ms, 2))
+        logger.info(
+            "request_complete method=%s path=%s status=%s latency_ms=%.2f request_id=%s",
+            request.method,
+            request.url.path,
+            response.status_code,
+            latency_ms,
+            request_id,
+        )
+        return response
 
 
 @app.get("/health")
@@ -144,7 +178,10 @@ def get_audit_events(
 @app.get("/v1/admin/metrics")
 def get_metrics(ctx: RequestContext = Depends(get_request_context)) -> dict:
     require_roles(ctx, {"admin", "owner"})
-    return workflow_metrics_store.snapshot()
+    return {
+        "workflow": workflow_metrics_store.snapshot(),
+        "endpoints": endpoint_metrics_store.snapshot(),
+    }
 
 
 @app.get("/v1/debates/{debate_id}/stream")
