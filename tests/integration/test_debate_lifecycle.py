@@ -98,3 +98,16 @@ def test_debate_stream_sse() -> None:
         assert response.status_code == 200
         assert "text/event-stream" in response.headers["content-type"]
         assert "debate_created" in response.text
+
+
+def test_workflow_parse_fallback_event() -> None:
+    with TestClient(app) as client:
+        created = client.post(
+            "/v1/debates",
+            json={"proposal": "trigger-parse-failure for report path"},
+            headers=HEADERS,
+        ).json()
+        debate_id = created["debate_id"]
+        events = client.get(f"/v1/debates/{debate_id}/events", headers=HEADERS).json()["events"]
+        event_types = [event["event_type"] for event in events]
+        assert "report_parse_fallback_used" in event_types
