@@ -51,6 +51,16 @@ Run API + worker together:
 API endpoint:
 - `http://localhost:8000/health`
 
+## Developer Shortcuts (Makefile)
+
+- `make up` -> start API + worker via Docker Compose
+- `make down` -> stop services
+- `make logs` -> stream service logs
+- `make test` -> run integration tests
+- `make migrate` -> run Alembic migrations
+- `make api` -> run API locally
+- `make worker` -> run Slack outbound worker locally
+
 ## Database Migrations
 
 - Create/update DB schema with Alembic:
