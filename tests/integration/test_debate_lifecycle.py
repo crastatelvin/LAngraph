@@ -1,0 +1,66 @@
+from pathlib import Path
+import sys
+
+from fastapi.testclient import TestClient
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from apps.api.main import app
+
+HEADERS = {
+    "X-Tenant-Id": "tenant-alpha",
+    "X-User-Id": "user-1",
+    "X-User-Role": "admin",
+}
+
+
+def test_debate_lifecycle() -> None:
+    client = TestClient(app)
+
+    create_resp = client.post(
+        "/v1/debates",
+        json={"proposal": "Adopt weekly async planning"},
+        headers=HEADERS,
+    )
+    assert create_resp.status_code == 200
+    created = create_resp.json()
+    debate_id = created["debate_id"]
+    assert created["status"] == "created"
+
+    get_resp = client.get(f"/v1/debates/{debate_id}", headers=HEADERS)
+    assert get_resp.status_code == 200
+    assert get_resp.json()["proposal"] == "Adopt weekly async planning"
+
+    events_resp = client.get(f"/v1/debates/{debate_id}/events", headers=HEADERS)
+    assert events_resp.status_code == 200
+    events = events_resp.json()["events"]
+    assert len(events) >= 2
+    assert events[0]["event_type"] == "debate_created"
+
+    approve_resp = client.post(f"/v1/debates/{debate_id}/approve", headers=HEADERS)
+    assert approve_resp.status_code == 200
+    assert approve_resp.json()["status"] == "approved"
+
+    events_after = client.get(f"/v1/debates/{debate_id}/events", headers=HEADERS).json()["events"]
+    assert events_after[-1]["event_type"] == "human_approved"
+
+    audit_resp = client.get("/v1/admin/audit", headers=HEADERS)
+    assert audit_resp.status_code == 200
+    assert len(audit_resp.json()) >= 4
+
+
+def test_not_found_paths() -> None:
+    client = TestClient(app)
+    missing_id = "missing-debate"
+
+    assert client.get(f"/v1/debates/{missing_id}", headers=HEADERS).status_code == 404
+    assert client.get(f"/v1/debates/{missing_id}/events", headers=HEADERS).status_code == 404
+    assert client.post(f"/v1/debates/{missing_id}/approve", headers=HEADERS).status_code == 404
+
+
+def test_missing_context_headers() -> None:
+    client = TestClient(app)
+    response = client.post("/v1/debates", json={"proposal": "Missing context should fail"})
+    assert response.status_code == 400
