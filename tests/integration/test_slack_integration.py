@@ -81,3 +81,63 @@ def test_slack_idempotency_duplicate_ignored() -> None:
                 api_main.os.environ.pop("SLACK_SIGNING_SECRET", None)
             else:
                 api_main.os.environ["SLACK_SIGNING_SECRET"] = old_secret
+
+
+def test_slack_command_creates_debate() -> None:
+    with TestClient(app) as client:
+        old_flag = api_main.os.getenv("ENABLE_SLACK_INTEGRATION")
+        old_secret = api_main.os.getenv("SLACK_SIGNING_SECRET")
+        api_main.os.environ["ENABLE_SLACK_INTEGRATION"] = "true"
+        api_main.os.environ["SLACK_SIGNING_SECRET"] = "test-secret"
+        try:
+            body = "command=/debate&text=Adopt+incident+review+cadence&team_id=T123&user_id=U123"
+            ts = str(int(time.time()))
+            sig = _sign("test-secret", body, ts)
+            headers = {
+                "X-Slack-Signature": sig,
+                "X-Slack-Request-Timestamp": ts,
+                "Content-Type": "application/x-www-form-urlencoded",
+            }
+            response = client.post("/v1/integrations/slack/commands", content=body, headers=headers)
+            assert response.status_code == 200
+            assert "Debate created:" in response.json()["text"]
+            assert response.json()["response_type"] == "in_channel"
+        finally:
+            if old_flag is None:
+                api_main.os.environ.pop("ENABLE_SLACK_INTEGRATION", None)
+            else:
+                api_main.os.environ["ENABLE_SLACK_INTEGRATION"] = old_flag
+            if old_secret is None:
+                api_main.os.environ.pop("SLACK_SIGNING_SECRET", None)
+            else:
+                api_main.os.environ["SLACK_SIGNING_SECRET"] = old_secret
+
+
+def test_slack_command_usage_message_on_empty_text() -> None:
+    with TestClient(app) as client:
+        old_flag = api_main.os.getenv("ENABLE_SLACK_INTEGRATION")
+        old_secret = api_main.os.getenv("SLACK_SIGNING_SECRET")
+        api_main.os.environ["ENABLE_SLACK_INTEGRATION"] = "true"
+        api_main.os.environ["SLACK_SIGNING_SECRET"] = "test-secret"
+        try:
+            body = "command=/debate&text=&team_id=T123&user_id=U123"
+            ts = str(int(time.time()))
+            sig = _sign("test-secret", body, ts)
+            headers = {
+                "X-Slack-Signature": sig,
+                "X-Slack-Request-Timestamp": ts,
+                "Content-Type": "application/x-www-form-urlencoded",
+            }
+            response = client.post("/v1/integrations/slack/commands", content=body, headers=headers)
+            assert response.status_code == 200
+            assert "Usage: /debate" in response.json()["text"]
+            assert response.json()["response_type"] == "ephemeral"
+        finally:
+            if old_flag is None:
+                api_main.os.environ.pop("ENABLE_SLACK_INTEGRATION", None)
+            else:
+                api_main.os.environ["ENABLE_SLACK_INTEGRATION"] = old_flag
+            if old_secret is None:
+                api_main.os.environ.pop("SLACK_SIGNING_SECRET", None)
+            else:
+                api_main.os.environ["SLACK_SIGNING_SECRET"] = old_secret

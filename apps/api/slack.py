@@ -3,6 +3,7 @@ import hmac
 import json
 import os
 import time
+from urllib.parse import parse_qs
 
 
 class SlackIntegration:
@@ -41,3 +42,7 @@ class SlackIntegration:
 
     def parse_body(self, body: bytes) -> dict:
         return json.loads(body.decode("utf-8"))
+
+    def parse_form_body(self, body: bytes) -> dict[str, str]:
+        parsed = parse_qs(body.decode("utf-8"), keep_blank_values=True)
+        return {key: values[0] for key, values in parsed.items()}

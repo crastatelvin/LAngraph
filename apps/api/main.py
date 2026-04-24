@@ -259,3 +259,54 @@ async def slack_events(request: Request) -> JSONResponse:
 
     event_type = payload.get("event", {}).get("type", "unknown")
     return JSONResponse(status_code=200, content={"status": "accepted", "event_type": event_type})
+
+
+@app.post("/v1/integrations/slack/commands")
+async def slack_commands(request: Request, db: Session = Depends(get_db)) -> JSONResponse:
+    if not slack_integration.enabled():
+        return JSONResponse(status_code=503, content={"detail": "Slack integration disabled"})
+
+    body = await request.body()
+    signature = request.headers.get("X-Slack-Signature")
+    timestamp = request.headers.get("X-Slack-Request-Timestamp")
+    if not slack_integration.verify_signature(timestamp, signature, body):
+        return JSONResponse(status_code=401, content={"detail": "Invalid Slack signature"})
+
+    form = slack_integration.parse_form_body(body)
+    command = form.get("command", "")
+    text = form.get("text", "").strip()
+    team_id = form.get("team_id", "unknown-team")
+    user_id = form.get("user_id", "unknown-user")
+
+    if command != "/debate":
+        return JSONResponse(status_code=200, content={"response_type": "ephemeral", "text": "Unsupported command."})
+    if not text:
+        return JSONResponse(
+            status_code=200,
+            content={"response_type": "ephemeral", "text": "Usage: /debate <proposal text>"},
+        )
+
+    tenant_id = f"slack-{team_id}"
+    request_id = f"slack-cmd-{int(time.time() * 1000)}"
+    record, workflow_metrics = store.create(
+        db=db,
+        proposal=text,
+        tenant_id=tenant_id,
+        request_id=request_id,
+    )
+    workflow_metrics_store.record_workflow(workflow_metrics)
+    audit_store.append(
+        db=db,
+        tenant_id=tenant_id,
+        actor_id=f"slack-{user_id}",
+        action="slack.command.debate.create",
+        resource=f"debates/{record.debate_id}",
+        payload={"request_id": request_id, "source": "slack", "command": command},
+    )
+    return JSONResponse(
+        status_code=200,
+        content={
+            "response_type": "in_channel",
+            "text": f"Debate created: {record.debate_id} for proposal '{record.proposal}'",
+        },
+    )
