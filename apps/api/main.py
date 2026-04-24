@@ -2,10 +2,12 @@ from dataclasses import asdict
 from contextlib import asynccontextmanager
 import json
 import logging
+import os
 import time
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi import Request
+from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse
 from opentelemetry import trace
 from sqlalchemy.orm import Session
@@ -40,6 +42,15 @@ workflow_metrics_store = WorkflowMetricsStore()
 endpoint_metrics_store = EndpointMetricsStore()
 logger = logging.getLogger("api.requests")
 tracer = trace.get_tracer("ai-parliament-api")
+rate_limit_store: dict[str, list[float]] = {}
+MAX_REQUESTS_PER_MINUTE = int(os.getenv("MAX_REQUESTS_PER_MINUTE", "240"))
+MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", "16384"))
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "X-XSS-Protection": "1; mode=block",
+}
 
 
 @app.middleware("http")
@@ -47,6 +58,21 @@ async def observe_requests(request: Request, call_next):
     started = time.perf_counter()
     request_id = request.headers.get("X-Request-Id", "missing")
     route_key = f"{request.method} {request.url.path}"
+    tenant_id = request.headers.get("X-Tenant-Id", "public")
+    user_id = request.headers.get("X-User-Id", request.client.host if request.client else "unknown")
+    limiter_key = f"{tenant_id}:{user_id}"
+    now = time.time()
+    recent = [ts for ts in rate_limit_store.get(limiter_key, []) if now - ts < 60.0]
+    if len(recent) >= MAX_REQUESTS_PER_MINUTE:
+        return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
+    recent.append(now)
+    rate_limit_store[limiter_key] = recent
+
+    if request.method in {"POST", "PUT", "PATCH"}:
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > MAX_REQUEST_BODY_BYTES:
+            return JSONResponse(status_code=413, content={"detail": "Request body too large"})
+
     with tracer.start_as_current_span("http.request") as span:
         span.set_attribute("http.method", request.method)
         span.set_attribute("http.route", request.url.path)
@@ -64,6 +90,8 @@ async def observe_requests(request: Request, call_next):
             latency_ms,
             request_id,
         )
+        for key, value in SECURITY_HEADERS.items():
+            response.headers[key] = value
         return response
 
 

@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import apps.api.main as api_main
 from apps.api.main import app
 
 HEADERS = {
@@ -122,3 +123,35 @@ def test_workflow_parse_fallback_event() -> None:
         metrics = client.get("/v1/admin/metrics", headers=HEADERS).json()
         assert metrics["workflow"]["fallback_count"] >= 1
         assert "POST /v1/debates" in metrics["endpoints"]
+
+
+def test_security_headers_present() -> None:
+    with TestClient(app) as client:
+        response = client.get("/health")
+        assert response.status_code == 200
+        assert response.headers["x-content-type-options"] == "nosniff"
+        assert response.headers["x-frame-options"] == "DENY"
+
+
+def test_request_body_size_limit() -> None:
+    with TestClient(app) as client:
+        oversized = "a" * 20000
+        response = client.post("/v1/debates", json={"proposal": oversized}, headers=HEADERS)
+        assert response.status_code == 413
+
+
+def test_rate_limit_enforced() -> None:
+    with TestClient(app) as client:
+        original_limit = api_main.MAX_REQUESTS_PER_MINUTE
+        api_main.MAX_REQUESTS_PER_MINUTE = 2
+        api_main.rate_limit_store.clear()
+        try:
+            first = client.get("/health")
+            second = client.get("/health")
+            third = client.get("/health")
+            assert first.status_code == 200
+            assert second.status_code == 200
+            assert third.status_code == 429
+        finally:
+            api_main.MAX_REQUESTS_PER_MINUTE = original_limit
+            api_main.rate_limit_store.clear()
