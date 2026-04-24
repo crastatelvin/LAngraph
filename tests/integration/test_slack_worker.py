@@ -6,9 +6,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from apps.api.db import SessionLocal
-from apps.api.models import SlackOutboundMessageModel, SlackSentDedupeModel
+from datetime import datetime, UTC, timedelta
+
+from apps.api.models import SlackInboundEventModel, SlackOutboundMessageModel, SlackSentDedupeModel
 from apps.api.slack import SlackIntegration
-from apps.worker.slack_outbound_worker import run_flush_once
+from apps.worker.slack_outbound_worker import run_cleanup_once, run_flush_once
 
 
 def test_worker_flush_once_sends_and_marks_dedupe() -> None:
@@ -54,3 +56,33 @@ def test_worker_flush_once_sends_and_marks_dedupe() -> None:
             os.environ.pop("SLACK_BOT_TOKEN", None)
         else:
             os.environ["SLACK_BOT_TOKEN"] = old_token
+
+
+def test_worker_cleanup_once_removes_old_rows() -> None:
+    db = SessionLocal()
+    db.query(SlackInboundEventModel).delete()
+    db.query(SlackSentDedupeModel).delete()
+    db.query(SlackOutboundMessageModel).delete()
+    db.commit()
+
+    old_iso = (datetime.now(UTC) - timedelta(hours=48)).isoformat()
+    db.add(SlackInboundEventModel(event_id="old-evt", seen_at=old_iso))
+    db.add(SlackSentDedupeModel(dedupe_key="old-dedupe", sent_at=old_iso))
+    db.add(
+        SlackOutboundMessageModel(
+            channel="C1",
+            text="old failed",
+            thread_ts=None,
+            dedupe_key=None,
+            attempts=3,
+            status="failed",
+            created_at=old_iso,
+        )
+    )
+    db.commit()
+    db.close()
+
+    result = run_cleanup_once(retention_hours=24)
+    assert result["deleted_inbound_events"] >= 1
+    assert result["deleted_sent_dedupes"] >= 1
+    assert result["deleted_failed_messages"] >= 1

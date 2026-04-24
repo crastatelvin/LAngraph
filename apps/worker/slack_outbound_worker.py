@@ -17,13 +17,23 @@ def run_flush_once(slack: SlackIntegration | None = None) -> dict:
         db.close()
 
 
+def run_cleanup_once(slack: SlackIntegration | None = None, retention_hours: int = 24) -> dict:
+    integration = slack or SlackIntegration()
+    db = SessionLocal()
+    try:
+        return integration.cleanup_old_state(db=db, retention_hours=retention_hours)
+    finally:
+        db.close()
+
+
 def run_forever() -> None:
     Base.metadata.create_all(bind=engine)
     interval_seconds = float(os.getenv("SLACK_OUTBOUND_FLUSH_INTERVAL_SECONDS", "5"))
     logger.info("Starting Slack outbound worker interval=%s", interval_seconds)
     while True:
         result = run_flush_once()
-        logger.info("Slack outbound worker cycle result=%s", result)
+        cleanup = run_cleanup_once(retention_hours=int(os.getenv("SLACK_RETENTION_HOURS", "24")))
+        logger.info("Slack outbound worker cycle result=%s cleanup=%s", result, cleanup)
         time.sleep(interval_seconds)
 
 

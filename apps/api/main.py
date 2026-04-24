@@ -373,3 +373,15 @@ def slack_outbound_flush(
 ) -> dict:
     require_roles(ctx, {"admin", "owner"})
     return slack_integration.flush_outbound_queue(db)
+
+
+@app.post("/v1/admin/slack/cleanup")
+def slack_cleanup(
+    retention_hours: int = 24,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> dict:
+    require_roles(ctx, {"admin", "owner"})
+    if retention_hours < 1 or retention_hours > 24 * 30:
+        raise HTTPException(status_code=400, detail="retention_hours must be between 1 and 720")
+    return slack_integration.cleanup_old_state(db=db, retention_hours=retention_hours)

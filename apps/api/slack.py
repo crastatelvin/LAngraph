@@ -148,6 +148,38 @@ class SlackIntegration:
         )
         return {"processed": processed, "sent": sent, "failed": failed, "remaining": remaining}
 
+    def cleanup_old_state(self, db: Session, retention_hours: int = 24) -> dict:
+        cutoff_iso = datetime.now(UTC).isoformat()
+        # Convert to deterministic cutoff using unix timestamp arithmetic.
+        cutoff_ts = time.time() - (retention_hours * 3600)
+        cutoff_iso = datetime.fromtimestamp(cutoff_ts, UTC).isoformat()
+
+        inbound_deleted = (
+            db.query(SlackInboundEventModel)
+            .filter(SlackInboundEventModel.seen_at < cutoff_iso)
+            .delete(synchronize_session=False)
+        )
+        dedupe_deleted = (
+            db.query(SlackSentDedupeModel)
+            .filter(SlackSentDedupeModel.sent_at < cutoff_iso)
+            .delete(synchronize_session=False)
+        )
+        failed_deleted = (
+            db.query(SlackOutboundMessageModel)
+            .filter(
+                SlackOutboundMessageModel.status == "failed",
+                SlackOutboundMessageModel.created_at < cutoff_iso,
+            )
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        return {
+            "retention_hours": retention_hours,
+            "deleted_inbound_events": inbound_deleted,
+            "deleted_sent_dedupes": dedupe_deleted,
+            "deleted_failed_messages": failed_deleted,
+        }
+
     def _send_chat_post_message(
         self, token: str, channel: str, text: str, thread_ts: str | None = None
     ) -> bool:
