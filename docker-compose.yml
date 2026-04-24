@@ -1,0 +1,38 @@
+version: "3.9"
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    command: >
+      sh -c "alembic upgrade head && uvicorn apps.api.main:app --host 0.0.0.0 --port 8000"
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: sqlite:////data/ai_parliament.db
+      ENABLE_SLACK_INTEGRATION: "false"
+      MAX_REQUESTS_PER_MINUTE: "240"
+      MAX_REQUEST_BODY_BYTES: "16384"
+    volumes:
+      - ai_parliament_data:/data
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    command: >
+      sh -c "alembic upgrade head && python -m apps.worker.slack_outbound_worker"
+    environment:
+      DATABASE_URL: sqlite:////data/ai_parliament.db
+      ENABLE_SLACK_INTEGRATION: "false"
+      SLACK_OUTBOUND_FLUSH_INTERVAL_SECONDS: "5"
+    volumes:
+      - ai_parliament_data:/data
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  ai_parliament_data:

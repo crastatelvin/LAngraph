@@ -43,6 +43,14 @@ docs/
 Run outbound Slack queue worker:
 - `python -m apps.worker.slack_outbound_worker`
 
+## Quickstart (Docker Compose)
+
+Run API + worker together:
+- `docker compose up --build`
+
+API endpoint:
+- `http://localhost:8000/health`
+
 ## Database Migrations
 
 - Create/update DB schema with Alembic:
