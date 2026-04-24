@@ -50,7 +50,7 @@ def test_admin_overview_compact_shape() -> None:
         assert response.status_code == 200
         payload = response.json()
         assert payload["scope"]["effective_tenant_id"] == "tenant-int-001"
-        assert payload["scope"]["queue_scope"] == "global"
+        assert payload["scope"]["queue_scope"] == "tenant"
         assert "workflow_total_runs" in payload["metrics"]
         assert "workflow" not in payload["metrics"]
 

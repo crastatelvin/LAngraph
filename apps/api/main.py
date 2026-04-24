@@ -56,6 +56,28 @@ SECURITY_HEADERS = {
 }
 
 
+def _queue_counts(db: Session, tenant_id: str | None = None) -> tuple[int, int]:
+    queued_query = db.query(SlackOutboundMessageModel).filter(
+        SlackOutboundMessageModel.status.in_(["queued", "retry"])
+    )
+    failed_query = db.query(SlackOutboundMessageModel).filter(SlackOutboundMessageModel.status == "failed")
+    if tenant_id:
+        queued_query = queued_query.filter(SlackOutboundMessageModel.tenant_id == tenant_id)
+        failed_query = failed_query.filter(SlackOutboundMessageModel.tenant_id == tenant_id)
+    return queued_query.count(), failed_query.count()
+
+
+def _slack_tenant_from_payload(payload: dict) -> str:
+    team_id = payload.get("team_id") or payload.get("team")
+    if isinstance(team_id, dict):
+        team_id = team_id.get("id")
+    event_team = payload.get("event", {}).get("team")
+    resolved = team_id or event_team
+    if not resolved:
+        return "slack-unknown-team"
+    return f"slack-{resolved}"
+
+
 @app.middleware("http")
 async def observe_requests(request: Request, call_next):
     started = time.perf_counter()
@@ -223,16 +245,7 @@ def get_slo(
     require_roles(ctx, {"admin", "owner"})
     workflow = workflow_metrics_store.snapshot()
     endpoints = endpoint_metrics_store.snapshot()
-    queued = (
-        db.query(SlackOutboundMessageModel)
-        .filter(SlackOutboundMessageModel.status.in_(["queued", "retry"]))
-        .count()
-    )
-    failed = (
-        db.query(SlackOutboundMessageModel)
-        .filter(SlackOutboundMessageModel.status == "failed")
-        .count()
-    )
+    queued, failed = _queue_counts(db, tenant_id=ctx.tenant_id)
     fallback_rate = 0.0
     if workflow["total_runs"] > 0:
         fallback_rate = round(workflow["fallback_count"] / workflow["total_runs"], 4)
@@ -266,16 +279,7 @@ def admin_health_dependencies(
 
     slack_enabled = slack_integration.enabled()
     slack_token_configured = bool(os.getenv("SLACK_BOT_TOKEN"))
-    queue_depth = (
-        db.query(SlackOutboundMessageModel)
-        .filter(SlackOutboundMessageModel.status.in_(["queued", "retry"]))
-        .count()
-    )
-    failed_depth = (
-        db.query(SlackOutboundMessageModel)
-        .filter(SlackOutboundMessageModel.status == "failed")
-        .count()
-    )
+    queue_depth, failed_depth = _queue_counts(db, tenant_id=ctx.tenant_id)
 
     return {
         "database": {"status": db_status},
@@ -311,16 +315,7 @@ def admin_overview(
     endpoints = endpoint_metrics_store.snapshot()
 
     # SLO snapshot
-    queued = (
-        db.query(SlackOutboundMessageModel)
-        .filter(SlackOutboundMessageModel.status.in_(["queued", "retry"]))
-        .count()
-    )
-    failed = (
-        db.query(SlackOutboundMessageModel)
-        .filter(SlackOutboundMessageModel.status == "failed")
-        .count()
-    )
+    queued, failed = _queue_counts(db, tenant_id=scope_tenant_id)
     fallback_rate = 0.0
     if workflow["total_runs"] > 0:
         fallback_rate = round(workflow["fallback_count"] / workflow["total_runs"], 4)
@@ -338,7 +333,7 @@ def admin_overview(
         "scope": {
             "requested_tenant_id": tenant_id,
             "effective_tenant_id": scope_tenant_id,
-            "queue_scope": "global",
+            "queue_scope": "tenant",
         },
         "health": {
             "database": {"status": db_status},
@@ -418,11 +413,12 @@ async def slack_events(request: Request, db: Session = Depends(get_db)) -> JSONR
         return JSONResponse(status_code=401, content={"detail": "Invalid Slack signature"})
 
     payload = slack_integration.parse_body(body)
+    slack_tenant_id = _slack_tenant_from_payload(payload)
     if "challenge" in payload:
         return JSONResponse(status_code=200, content={"challenge": payload["challenge"]})
 
     event_id = payload.get("event_id")
-    if slack_integration.is_duplicate(db, event_id):
+    if slack_integration.is_duplicate(db, event_id, tenant_id=slack_tenant_id):
         return JSONResponse(status_code=200, content={"status": "duplicate_ignored"})
 
     event_type = payload.get("event", {}).get("type", "unknown")
@@ -475,6 +471,7 @@ async def slack_commands(request: Request, db: Session = Depends(get_db)) -> JSO
     if channel_id:
         slack_integration.queue_thread_message(
             db=db,
+            tenant_id=tenant_id,
             channel=channel_id,
             text=f"Debate `{record.debate_id}` queued. Proposal: {record.proposal}",
             dedupe_key=f"debate-created:{record.debate_id}",
@@ -494,7 +491,7 @@ def slack_outbound_status(
     db: Session = Depends(get_db),
 ) -> dict:
     require_roles(ctx, {"admin", "owner"})
-    return slack_integration.outbound_status(db)
+    return slack_integration.outbound_status(db, tenant_id=ctx.tenant_id)
 
 
 @app.post("/v1/integrations/slack/outbound/flush")
@@ -503,7 +500,7 @@ def slack_outbound_flush(
     db: Session = Depends(get_db),
 ) -> dict:
     require_roles(ctx, {"admin", "owner"})
-    return slack_integration.flush_outbound_queue(db)
+    return slack_integration.flush_outbound_queue(db, tenant_id=ctx.tenant_id)
 
 
 @app.post("/v1/admin/slack/cleanup")

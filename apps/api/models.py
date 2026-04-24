@@ -40,7 +40,8 @@ class SlackInboundEventModel(Base):
     __tablename__ = "slack_inbound_events"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    event_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    event_id: Mapped[str] = mapped_column(String(128), index=True)
     seen_at: Mapped[str] = mapped_column(String(64))
 
 
@@ -48,7 +49,8 @@ class SlackSentDedupeModel(Base):
     __tablename__ = "slack_sent_dedupes"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    dedupe_key: Mapped[str] = mapped_column(String(256), unique=True, index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    dedupe_key: Mapped[str] = mapped_column(String(256), index=True)
     sent_at: Mapped[str] = mapped_column(String(64))
 
 
@@ -56,6 +58,7 @@ class SlackOutboundMessageModel(Base):
     __tablename__ = "slack_outbound_messages"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
     channel: Mapped[str] = mapped_column(String(128), index=True)
     text: Mapped[str] = mapped_column(Text())
     thread_ts: Mapped[str] = mapped_column(String(64), nullable=True)

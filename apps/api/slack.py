@@ -34,13 +34,26 @@ class SlackIntegration:
         expected = f"v0={digest}"
         return hmac.compare_digest(expected, signature)
 
-    def is_duplicate(self, db: Session, event_id: str | None) -> bool:
+    def is_duplicate(self, db: Session, event_id: str | None, tenant_id: str = "public") -> bool:
         if not event_id:
             return False
-        exists = db.query(SlackInboundEventModel).filter(SlackInboundEventModel.event_id == event_id).first()
+        exists = (
+            db.query(SlackInboundEventModel)
+            .filter(
+                SlackInboundEventModel.tenant_id == tenant_id,
+                SlackInboundEventModel.event_id == event_id,
+            )
+            .first()
+        )
         if exists is not None:
             return True
-        db.add(SlackInboundEventModel(event_id=event_id, seen_at=datetime.now(UTC).isoformat()))
+        db.add(
+            SlackInboundEventModel(
+                tenant_id=tenant_id,
+                event_id=event_id,
+                seen_at=datetime.now(UTC).isoformat(),
+            )
+        )
         db.commit()
         return False
 
@@ -54,16 +67,25 @@ class SlackIntegration:
     def queue_thread_message(
         self,
         db: Session,
+        tenant_id: str,
         channel: str,
         text: str,
         thread_ts: str | None = None,
         dedupe_key: str | None = None,
     ) -> bool:
         if dedupe_key:
-            sent = db.query(SlackSentDedupeModel).filter(SlackSentDedupeModel.dedupe_key == dedupe_key).first()
+            sent = (
+                db.query(SlackSentDedupeModel)
+                .filter(
+                    SlackSentDedupeModel.tenant_id == tenant_id,
+                    SlackSentDedupeModel.dedupe_key == dedupe_key,
+                )
+                .first()
+            )
             queued = (
                 db.query(SlackOutboundMessageModel)
                 .filter(
+                    SlackOutboundMessageModel.tenant_id == tenant_id,
                     SlackOutboundMessageModel.dedupe_key == dedupe_key,
                     SlackOutboundMessageModel.status.in_(["queued", "retry"]),
                 )
@@ -74,6 +96,7 @@ class SlackIntegration:
 
         db.add(
             SlackOutboundMessageModel(
+                tenant_id=tenant_id,
                 channel=channel,
                 text=text,
                 thread_ts=thread_ts,
@@ -86,16 +109,21 @@ class SlackIntegration:
         db.commit()
         return True
 
-    def outbound_status(self, db: Session) -> dict:
+    def outbound_status(self, db: Session, tenant_id: str | None = None) -> dict:
+        outbound_query = db.query(SlackOutboundMessageModel)
+        dedupe_query = db.query(SlackSentDedupeModel)
+        if tenant_id:
+            outbound_query = outbound_query.filter(SlackOutboundMessageModel.tenant_id == tenant_id)
+            dedupe_query = dedupe_query.filter(SlackSentDedupeModel.tenant_id == tenant_id)
         queued = (
-            db.query(SlackOutboundMessageModel)
+            outbound_query
             .filter(SlackOutboundMessageModel.status.in_(["queued", "retry"]))
             .count()
         )
-        sent = db.query(SlackSentDedupeModel).count()
+        sent = dedupe_query.count()
         return {"queued": queued, "sent_dedupes": sent}
 
-    def flush_outbound_queue(self, db: Session, max_items: int = 20) -> dict:
+    def flush_outbound_queue(self, db: Session, max_items: int = 20, tenant_id: str | None = None) -> dict:
         if not self.enabled():
             return {"processed": 0, "sent": 0, "failed": 0, "detail": "integration_disabled"}
         token = os.getenv("SLACK_BOT_TOKEN", "")
@@ -104,7 +132,10 @@ class SlackIntegration:
 
         items = (
             db.query(SlackOutboundMessageModel)
-            .filter(SlackOutboundMessageModel.status.in_(["queued", "retry"]))
+            .filter(
+                SlackOutboundMessageModel.status.in_(["queued", "retry"]),
+                SlackOutboundMessageModel.tenant_id == tenant_id if tenant_id else True,
+            )
             .order_by(SlackOutboundMessageModel.id.asc())
             .limit(max_items)
             .all()
@@ -128,13 +159,18 @@ class SlackIntegration:
                 if item.dedupe_key:
                     existing = (
                         db.query(SlackSentDedupeModel)
-                        .filter(SlackSentDedupeModel.dedupe_key == item.dedupe_key)
+                        .filter(
+                            SlackSentDedupeModel.tenant_id == item.tenant_id,
+                            SlackSentDedupeModel.dedupe_key == item.dedupe_key,
+                        )
                         .first()
                     )
                     if existing is None:
                         db.add(
                             SlackSentDedupeModel(
-                                dedupe_key=item.dedupe_key, sent_at=datetime.now(UTC).isoformat()
+                                tenant_id=item.tenant_id,
+                                dedupe_key=item.dedupe_key,
+                                sent_at=datetime.now(UTC).isoformat(),
                             )
                         )
             else:
@@ -143,7 +179,10 @@ class SlackIntegration:
         db.commit()
         remaining = (
             db.query(SlackOutboundMessageModel)
-            .filter(SlackOutboundMessageModel.status.in_(["queued", "retry"]))
+            .filter(
+                SlackOutboundMessageModel.status.in_(["queued", "retry"]),
+                SlackOutboundMessageModel.tenant_id == tenant_id if tenant_id else True,
+            )
             .count()
         )
         return {"processed": processed, "sent": sent, "failed": failed, "remaining": remaining}

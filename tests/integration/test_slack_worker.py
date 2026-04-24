@@ -36,14 +36,27 @@ def test_worker_flush_once_sends_and_marks_dedupe() -> None:
     os.environ["SLACK_BOT_TOKEN"] = "xoxb-test"
     try:
         db = SessionLocal()
-        slack.queue_thread_message(db=db, channel="C777", text="worker test", dedupe_key="wk1")
+        slack.queue_thread_message(
+            db=db,
+            tenant_id="tenant-int-001",
+            channel="C777",
+            text="worker test",
+            dedupe_key="wk1",
+        )
         db.close()
 
         result = run_flush_once(slack=slack)
         assert result["sent"] == 1
 
         db = SessionLocal()
-        sent = db.query(SlackSentDedupeModel).filter(SlackSentDedupeModel.dedupe_key == "wk1").first()
+        sent = (
+            db.query(SlackSentDedupeModel)
+            .filter(
+                SlackSentDedupeModel.tenant_id == "tenant-int-001",
+                SlackSentDedupeModel.dedupe_key == "wk1",
+            )
+            .first()
+        )
         db.close()
         assert sent is not None
     finally:
@@ -66,10 +79,11 @@ def test_worker_cleanup_once_removes_old_rows() -> None:
     db.commit()
 
     old_iso = (datetime.now(UTC) - timedelta(hours=48)).isoformat()
-    db.add(SlackInboundEventModel(event_id="old-evt", seen_at=old_iso))
-    db.add(SlackSentDedupeModel(dedupe_key="old-dedupe", sent_at=old_iso))
+    db.add(SlackInboundEventModel(tenant_id="tenant-int-001", event_id="old-evt", seen_at=old_iso))
+    db.add(SlackSentDedupeModel(tenant_id="tenant-int-001", dedupe_key="old-dedupe", sent_at=old_iso))
     db.add(
         SlackOutboundMessageModel(
+            tenant_id="tenant-int-001",
             channel="C1",
             text="old failed",
             thread_ts=None,

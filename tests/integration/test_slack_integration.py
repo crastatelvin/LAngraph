@@ -108,7 +108,7 @@ def test_slack_command_creates_debate() -> None:
             assert "Debate created:" in response.json()["text"]
             assert response.json()["response_type"] == "in_channel"
             status_headers = {
-                "X-Tenant-Id": "tenant-int-001",
+                "X-Tenant-Id": "slack-T123",
                 "X-User-Id": "user-1",
                 "X-User-Role": "admin",
             }
@@ -180,7 +180,11 @@ def test_slack_outbound_flush_retry_safe() -> None:
         try:
             db = SessionLocal()
             api_main.slack_integration.queue_thread_message(
-                db=db, channel="C999", text="Hello thread", dedupe_key="d1"
+                db=db,
+                tenant_id="tenant-int-001",
+                channel="C999",
+                text="Hello thread",
+                dedupe_key="d1",
             )
             db.close()
             status_headers = {
@@ -196,7 +200,11 @@ def test_slack_outbound_flush_retry_safe() -> None:
             # Deduped message should not enqueue again.
             db = SessionLocal()
             enqueued = api_main.slack_integration.queue_thread_message(
-                db=db, channel="C999", text="Hello thread", dedupe_key="d1"
+                db=db,
+                tenant_id="tenant-int-001",
+                channel="C999",
+                text="Hello thread",
+                dedupe_key="d1",
             )
             db.close()
             assert enqueued is False
