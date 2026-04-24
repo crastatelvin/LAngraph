@@ -292,6 +292,76 @@ def admin_health_dependencies(
     }
 
 
+@app.get("/v1/admin/overview")
+def admin_overview(
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> dict:
+    require_roles(ctx, {"admin", "owner"})
+
+    # Metrics snapshot
+    workflow = workflow_metrics_store.snapshot()
+    endpoints = endpoint_metrics_store.snapshot()
+
+    # SLO snapshot
+    queued = (
+        db.query(SlackOutboundMessageModel)
+        .filter(SlackOutboundMessageModel.status.in_(["queued", "retry"]))
+        .count()
+    )
+    failed = (
+        db.query(SlackOutboundMessageModel)
+        .filter(SlackOutboundMessageModel.status == "failed")
+        .count()
+    )
+    fallback_rate = 0.0
+    if workflow["total_runs"] > 0:
+        fallback_rate = round(workflow["fallback_count"] / workflow["total_runs"], 4)
+
+    # Dependency health snapshot
+    db_status = "ok"
+    try:
+        db.execute(text("SELECT 1"))
+    except Exception:
+        db_status = "error"
+    slack_enabled = slack_integration.enabled()
+    slack_token_configured = bool(os.getenv("SLACK_BOT_TOKEN"))
+
+    return {
+        "health": {
+            "database": {"status": db_status},
+            "slack": {
+                "enabled": slack_enabled,
+                "bot_token_configured": slack_token_configured,
+                "ready": (not slack_enabled) or (slack_enabled and slack_token_configured),
+            },
+            "worker_queue": {
+                "queued": queued,
+                "failed": failed,
+                "status": "backlog" if queued > 100 else "ok",
+            },
+        },
+        "slo": {
+            "slo_targets": {
+                "api_non_llm_p95_ms_target": 700,
+                "debate_completion_target_s": 60,
+            },
+            "observed": {
+                "workflow_avg_latency_ms": workflow["avg_workflow_latency_ms"],
+                "workflow_fallback_rate": fallback_rate,
+                "workflow_parse_failures": workflow["parse_failure_count"],
+                "endpoint_count": len(endpoints),
+                "slack_queue_depth": queued,
+                "slack_failed_messages": failed,
+            },
+        },
+        "metrics": {
+            "workflow": workflow,
+            "endpoints": endpoints,
+        },
+    }
+
+
 @app.get("/v1/debates/{debate_id}/stream")
 def stream_debate_events(
     debate_id: str,
