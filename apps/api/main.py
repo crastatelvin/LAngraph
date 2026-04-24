@@ -10,6 +10,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse
 from opentelemetry import trace
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from apps.api.audit import AuditStore
@@ -247,6 +248,46 @@ def get_slo(
             "endpoint_count": len(endpoints),
             "slack_queue_depth": queued,
             "slack_failed_messages": failed,
+        },
+    }
+
+
+@app.get("/v1/admin/health/dependencies")
+def admin_health_dependencies(
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> dict:
+    require_roles(ctx, {"admin", "owner"})
+    db_status = "ok"
+    try:
+        db.execute(text("SELECT 1"))
+    except Exception:
+        db_status = "error"
+
+    slack_enabled = slack_integration.enabled()
+    slack_token_configured = bool(os.getenv("SLACK_BOT_TOKEN"))
+    queue_depth = (
+        db.query(SlackOutboundMessageModel)
+        .filter(SlackOutboundMessageModel.status.in_(["queued", "retry"]))
+        .count()
+    )
+    failed_depth = (
+        db.query(SlackOutboundMessageModel)
+        .filter(SlackOutboundMessageModel.status == "failed")
+        .count()
+    )
+
+    return {
+        "database": {"status": db_status},
+        "slack": {
+            "enabled": slack_enabled,
+            "bot_token_configured": slack_token_configured,
+            "ready": (not slack_enabled) or (slack_enabled and slack_token_configured),
+        },
+        "worker_queue": {
+            "queued": queue_depth,
+            "failed": failed_depth,
+            "status": "backlog" if queue_depth > 100 else "ok",
         },
     }
 
