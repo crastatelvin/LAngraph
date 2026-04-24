@@ -90,7 +90,7 @@ def test_slack_command_creates_debate() -> None:
         api_main.os.environ["ENABLE_SLACK_INTEGRATION"] = "true"
         api_main.os.environ["SLACK_SIGNING_SECRET"] = "test-secret"
         try:
-            body = "command=/debate&text=Adopt+incident+review+cadence&team_id=T123&user_id=U123"
+            body = "command=/debate&text=Adopt+incident+review+cadence&team_id=T123&user_id=U123&channel_id=C123"
             ts = str(int(time.time()))
             sig = _sign("test-secret", body, ts)
             headers = {
@@ -102,6 +102,14 @@ def test_slack_command_creates_debate() -> None:
             assert response.status_code == 200
             assert "Debate created:" in response.json()["text"]
             assert response.json()["response_type"] == "in_channel"
+            status_headers = {
+                "X-Tenant-Id": "tenant-int-001",
+                "X-User-Id": "user-1",
+                "X-User-Role": "admin",
+            }
+            status = client.get("/v1/integrations/slack/outbound/status", headers=status_headers)
+            assert status.status_code == 200
+            assert status.json()["queued"] >= 1
         finally:
             if old_flag is None:
                 api_main.os.environ.pop("ENABLE_SLACK_INTEGRATION", None)
@@ -141,3 +149,56 @@ def test_slack_command_usage_message_on_empty_text() -> None:
                 api_main.os.environ.pop("SLACK_SIGNING_SECRET", None)
             else:
                 api_main.os.environ["SLACK_SIGNING_SECRET"] = old_secret
+
+
+def test_slack_outbound_flush_retry_safe() -> None:
+    with TestClient(app) as client:
+        old_flag = api_main.os.getenv("ENABLE_SLACK_INTEGRATION")
+        old_secret = api_main.os.getenv("SLACK_SIGNING_SECRET")
+        old_token = api_main.os.getenv("SLACK_BOT_TOKEN")
+        api_main.os.environ["ENABLE_SLACK_INTEGRATION"] = "true"
+        api_main.os.environ["SLACK_SIGNING_SECRET"] = "test-secret"
+        api_main.os.environ["SLACK_BOT_TOKEN"] = "xoxb-test"
+        api_main.slack_integration._outbound_queue.clear()
+        api_main.slack_integration._sent_dedupe_keys.clear()
+        sent_calls: list[tuple[str, str]] = []
+
+        def fake_send(token: str, channel: str, text: str, thread_ts: str | None = None) -> bool:
+            sent_calls.append((channel, text))
+            return True
+
+        original_sender = api_main.slack_integration._send_chat_post_message
+        api_main.slack_integration._send_chat_post_message = fake_send
+        try:
+            api_main.slack_integration.queue_thread_message(
+                channel="C999", text="Hello thread", dedupe_key="d1"
+            )
+            status_headers = {
+                "X-Tenant-Id": "tenant-int-001",
+                "X-User-Id": "user-1",
+                "X-User-Role": "admin",
+            }
+            flush = client.post("/v1/integrations/slack/outbound/flush", headers=status_headers)
+            assert flush.status_code == 200
+            assert flush.json()["sent"] == 1
+            assert len(sent_calls) == 1
+
+            # Deduped message should not enqueue again.
+            enqueued = api_main.slack_integration.queue_thread_message(
+                channel="C999", text="Hello thread", dedupe_key="d1"
+            )
+            assert enqueued is False
+        finally:
+            api_main.slack_integration._send_chat_post_message = original_sender
+            if old_flag is None:
+                api_main.os.environ.pop("ENABLE_SLACK_INTEGRATION", None)
+            else:
+                api_main.os.environ["ENABLE_SLACK_INTEGRATION"] = old_flag
+            if old_secret is None:
+                api_main.os.environ.pop("SLACK_SIGNING_SECRET", None)
+            else:
+                api_main.os.environ["SLACK_SIGNING_SECRET"] = old_secret
+            if old_token is None:
+                api_main.os.environ.pop("SLACK_BOT_TOKEN", None)
+            else:
+                api_main.os.environ["SLACK_BOT_TOKEN"] = old_token

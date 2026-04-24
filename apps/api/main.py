@@ -303,6 +303,13 @@ async def slack_commands(request: Request, db: Session = Depends(get_db)) -> JSO
         resource=f"debates/{record.debate_id}",
         payload={"request_id": request_id, "source": "slack", "command": command},
     )
+    channel_id = form.get("channel_id", "")
+    if channel_id:
+        slack_integration.queue_thread_message(
+            channel=channel_id,
+            text=f"Debate `{record.debate_id}` queued. Proposal: {record.proposal}",
+            dedupe_key=f"debate-created:{record.debate_id}",
+        )
     return JSONResponse(
         status_code=200,
         content={
@@ -310,3 +317,15 @@ async def slack_commands(request: Request, db: Session = Depends(get_db)) -> JSO
             "text": f"Debate created: {record.debate_id} for proposal '{record.proposal}'",
         },
     )
+
+
+@app.get("/v1/integrations/slack/outbound/status")
+def slack_outbound_status(ctx: RequestContext = Depends(get_request_context)) -> dict:
+    require_roles(ctx, {"admin", "owner"})
+    return slack_integration.outbound_status()
+
+
+@app.post("/v1/integrations/slack/outbound/flush")
+def slack_outbound_flush(ctx: RequestContext = Depends(get_request_context)) -> dict:
+    require_roles(ctx, {"admin", "owner"})
+    return slack_integration.flush_outbound_queue()
