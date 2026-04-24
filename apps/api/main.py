@@ -294,10 +294,17 @@ def admin_health_dependencies(
 
 @app.get("/v1/admin/overview")
 def admin_overview(
+    compact: bool = False,
+    tenant_id: str | None = None,
     ctx: RequestContext = Depends(get_request_context),
     db: Session = Depends(get_db),
 ) -> dict:
     require_roles(ctx, {"admin", "owner"})
+    scope_tenant_id = ctx.tenant_id
+    if tenant_id and tenant_id != ctx.tenant_id:
+        if ctx.user_role != "owner":
+            raise HTTPException(status_code=403, detail="Only owner can query cross-tenant overview")
+        scope_tenant_id = tenant_id
 
     # Metrics snapshot
     workflow = workflow_metrics_store.snapshot()
@@ -327,7 +334,12 @@ def admin_overview(
     slack_enabled = slack_integration.enabled()
     slack_token_configured = bool(os.getenv("SLACK_BOT_TOKEN"))
 
-    return {
+    payload = {
+        "scope": {
+            "requested_tenant_id": tenant_id,
+            "effective_tenant_id": scope_tenant_id,
+            "queue_scope": "global",
+        },
         "health": {
             "database": {"status": db_status},
             "slack": {
@@ -355,11 +367,19 @@ def admin_overview(
                 "slack_failed_messages": failed,
             },
         },
-        "metrics": {
+    }
+    if compact:
+        payload["metrics"] = {
+            "workflow_total_runs": workflow["total_runs"],
+            "workflow_fallback_count": workflow["fallback_count"],
+            "endpoint_count": len(endpoints),
+        }
+    else:
+        payload["metrics"] = {
             "workflow": workflow,
             "endpoints": endpoints,
-        },
-    }
+        }
+    return payload
 
 
 @app.get("/v1/debates/{debate_id}/stream")
