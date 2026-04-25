@@ -226,6 +226,66 @@ export async function recalibrateAgent(agentId: string): Promise<AgentRecord> {
   return response.json();
 }
 
+export async function ingestAgentOutcome(
+  agentId: string,
+  payload: {
+    debate_id: string;
+    predicted_confidence: number;
+    actual_score: number;
+    notes?: string;
+  }
+): Promise<Record<string, unknown>> {
+  const response = await fetch(`${API_BASE_URL}/v1/agents/${agentId}/outcomes`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...DEFAULT_HEADERS,
+      "X-Request-Id": `web-agents-outcome-${Date.now()}`,
+    },
+    body: JSON.stringify(payload),
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to ingest outcome: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function evolveAgent(
+  agentId: string,
+  payload: { max_delta?: number; reason?: string }
+): Promise<Record<string, unknown>> {
+  const response = await fetch(`${API_BASE_URL}/v1/agents/${agentId}/evolve`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...DEFAULT_HEADERS,
+      "X-Request-Id": `web-agents-evolve-${Date.now()}`,
+    },
+    body: JSON.stringify(payload),
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to evolve agent: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function rollbackAgent(agentId: string, version: number): Promise<Record<string, unknown>> {
+  const response = await fetch(`${API_BASE_URL}/v1/agents/${agentId}/rollback/${version}`, {
+    method: "POST",
+    headers: {
+      ...DEFAULT_HEADERS,
+      "X-Request-Id": `web-agents-rollback-${Date.now()}`,
+    },
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to rollback agent: ${response.status}`);
+  }
+  return response.json();
+}
+
 export async function getAdminOverview(compact = true): Promise<Record<string, unknown>> {
   const query = compact ? "?compact=true" : "";
   const response = await fetch(`${API_BASE_URL}/v1/admin/overview${query}`, {

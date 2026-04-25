@@ -7,6 +7,7 @@ import {
   createDebate,
   createFederation,
   createFederationSession,
+  evolveAgent,
   flushSlackOutbound,
   getAdminOverview,
   getAdminSlo,
@@ -14,9 +15,11 @@ import {
   getFederationDecision,
   getSlackOutboundStatus,
   getTxStatus,
+  ingestAgentOutcome,
   listAgents,
   patchAgent,
   recalibrateAgent,
+  rollbackAgent,
   joinFederationSession,
 } from "../lib/api";
 
@@ -36,6 +39,10 @@ export default function DashboardPage() {
   const [agentId, setAgentId] = useState("agent-web-001");
   const [agentTraitsText, setAgentTraitsText] = useState('{"risk_tolerance": 0.4, "priority": "reliability"}');
   const [agentOutput, setAgentOutput] = useState<Record<string, unknown> | Array<Record<string, unknown>> | null>(null);
+  const [outcomeDebateId, setOutcomeDebateId] = useState("debate-web-001");
+  const [predictedConfidence, setPredictedConfidence] = useState("0.55");
+  const [actualScore, setActualScore] = useState("0.80");
+  const [rollbackVersion, setRollbackVersion] = useState("1");
   const [adminOutput, setAdminOutput] = useState<Record<string, unknown> | null>(null);
 
   async function onCreate() {
@@ -153,6 +160,44 @@ export default function DashboardPage() {
       setError("");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to recalibrate agent");
+    }
+  }
+
+  async function onIngestOutcome() {
+    try {
+      const response = await ingestAgentOutcome(agentId, {
+        debate_id: outcomeDebateId,
+        predicted_confidence: Number(predictedConfidence),
+        actual_score: Number(actualScore),
+        notes: "Web panel outcome ingestion",
+      });
+      setAgentOutput(response);
+      setError("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to ingest outcome");
+    }
+  }
+
+  async function onEvolveAgent() {
+    try {
+      const response = await evolveAgent(agentId, {
+        max_delta: 0.1,
+        reason: "web_evolution_cycle",
+      });
+      setAgentOutput(response);
+      setError("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to evolve agent");
+    }
+  }
+
+  async function onRollbackAgent() {
+    try {
+      const response = await rollbackAgent(agentId, Number(rollbackVersion));
+      setAgentOutput(response);
+      setError("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to rollback agent");
     }
   }
 
@@ -328,7 +373,7 @@ export default function DashboardPage() {
 
       <section className="card">
         <h2 style={{ marginTop: 0 }}>Agents Panel</h2>
-        <p className="muted">List tenant agents, patch traits, and trigger calibration updates.</p>
+        <p className="muted">Manage agents, ingest outcomes, evolve traits, and rollback versions.</p>
         <input
           className="input"
           value={agentId}
@@ -352,6 +397,47 @@ export default function DashboardPage() {
           </button>
           <button className="button" onClick={onRecalibrateAgent} disabled={!agentId}>
             Recalibrate
+          </button>
+        </div>
+        <input
+          className="input"
+          style={{ marginTop: 8 }}
+          value={outcomeDebateId}
+          onChange={(event) => setOutcomeDebateId(event.target.value)}
+          placeholder="Outcome debate ID"
+        />
+        <div style={{ marginTop: 8, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+          <input
+            className="input"
+            value={predictedConfidence}
+            onChange={(event) => setPredictedConfidence(event.target.value)}
+            placeholder="Predicted confidence"
+          />
+          <input
+            className="input"
+            value={actualScore}
+            onChange={(event) => setActualScore(event.target.value)}
+            placeholder="Actual score"
+          />
+        </div>
+        <div style={{ marginTop: 8, display: "flex", gap: 8 }}>
+          <button className="button" onClick={onIngestOutcome} disabled={!agentId || !outcomeDebateId}>
+            Ingest Outcome
+          </button>
+          <button className="button" onClick={onEvolveAgent} disabled={!agentId}>
+            Evolve
+          </button>
+        </div>
+        <div style={{ marginTop: 8, display: "flex", gap: 8 }}>
+          <input
+            className="input"
+            style={{ maxWidth: 160 }}
+            value={rollbackVersion}
+            onChange={(event) => setRollbackVersion(event.target.value)}
+            placeholder="Rollback version"
+          />
+          <button className="button" onClick={onRollbackAgent} disabled={!agentId || !rollbackVersion}>
+            Rollback
           </button>
         </div>
       </section>
