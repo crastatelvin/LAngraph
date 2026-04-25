@@ -94,3 +94,40 @@ class AgentProfileVersionModel(Base):
     reason: Mapped[str] = mapped_column(String(256))
     created_at: Mapped[str] = mapped_column(String(64))
 
+
+class FederationModel(Base):
+    __tablename__ = "federations"
+
+    federation_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    name: Mapped[str] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(String(32), default="active")
+    created_by: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[str] = mapped_column(String(64))
+
+
+class FederationSessionModel(Base):
+    __tablename__ = "federation_sessions"
+
+    session_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    federation_id: Mapped[str] = mapped_column(String(64), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="open")
+    created_by: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[str] = mapped_column(String(64))
+
+
+class FederationSessionSubmissionModel(Base):
+    __tablename__ = "federation_session_submissions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(String(64), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    parliament_name: Mapped[str] = mapped_column(String(128))
+    position: Mapped[str] = mapped_column(String(32))
+    confidence: Mapped[float] = mapped_column(Float())
+    summary: Mapped[str] = mapped_column(Text())
+    weight: Mapped[float] = mapped_column(Float(), default=1.0)
+    submitted_by: Mapped[str] = mapped_column(String(128))
+    submitted_at: Mapped[str] = mapped_column(String(64))
+

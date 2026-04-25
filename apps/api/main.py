@@ -5,6 +5,7 @@ import logging
 import os
 import time
 from datetime import UTC, datetime
+from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi import Request
@@ -24,6 +25,9 @@ from apps.api.models import (
     AgentProfileModel,
     AgentProfileVersionModel,
     DebateModel,
+    FederationModel,
+    FederationSessionModel,
+    FederationSessionSubmissionModel,
     SlackOutboundMessageModel,
 )
 from apps.api.store import DebateStore
@@ -78,6 +82,22 @@ class AgentRecord(BaseModel):
 class AgentPatchRequest(BaseModel):
     traits: dict = Field(default_factory=dict)
     reason: str = Field(default="manual_update", min_length=3, max_length=256)
+
+
+class FederationCreateRequest(BaseModel):
+    name: str = Field(min_length=3, max_length=128)
+
+
+class FederationSessionCreateRequest(BaseModel):
+    mode: str = Field(default="standard", min_length=3, max_length=32)
+
+
+class FederationJoinRequest(BaseModel):
+    parliament_name: str = Field(min_length=2, max_length=128)
+    position: str = Field(pattern="^(APPROVED|REJECTED|INCONCLUSIVE)$")
+    confidence: float = Field(ge=0.0, le=1.0)
+    summary: str = Field(min_length=5, max_length=4000)
+    weight: float = Field(default=1.0, ge=0.1, le=10.0)
 
 
 def _queue_counts(db: Session, tenant_id: str | None = None) -> tuple[int, int]:
@@ -356,6 +376,176 @@ def recalibrate_agent(
         payload={"version": row.version, "request_id": ctx.request_id},
     )
     return _to_agent_record(row).model_dump()
+
+
+@app.post("/v1/federations")
+def create_federation(
+    payload: FederationCreateRequest,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> dict:
+    require_roles(ctx, {"admin", "owner"})
+    federation_id = str(uuid4())
+    row = FederationModel(
+        federation_id=federation_id,
+        tenant_id=ctx.tenant_id,
+        name=payload.name,
+        status="active",
+        created_by=ctx.user_id,
+        created_at=datetime.now(UTC).isoformat(),
+    )
+    db.add(row)
+    db.commit()
+    audit_store.append(
+        db=db,
+        tenant_id=ctx.tenant_id,
+        actor_id=ctx.user_id,
+        action="federation.create",
+        resource=f"federations/{federation_id}",
+        payload={"name": payload.name, "request_id": ctx.request_id},
+    )
+    return {"federation_id": federation_id, "name": payload.name, "status": "active"}
+
+
+@app.post("/v1/federations/{federation_id}/sessions")
+def create_federation_session(
+    federation_id: str,
+    payload: FederationSessionCreateRequest,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> dict:
+    require_roles(ctx, {"admin", "owner"})
+    federation = (
+        db.query(FederationModel)
+        .filter(FederationModel.federation_id == federation_id, FederationModel.tenant_id == ctx.tenant_id)
+        .first()
+    )
+    if federation is None:
+        raise HTTPException(status_code=404, detail="Federation not found")
+    session_id = str(uuid4())
+    row = FederationSessionModel(
+        session_id=session_id,
+        federation_id=federation_id,
+        tenant_id=ctx.tenant_id,
+        status="open",
+        created_by=ctx.user_id,
+        created_at=datetime.now(UTC).isoformat(),
+    )
+    db.add(row)
+    db.commit()
+    audit_store.append(
+        db=db,
+        tenant_id=ctx.tenant_id,
+        actor_id=ctx.user_id,
+        action="federation.session.create",
+        resource=f"federations/{federation_id}/sessions/{session_id}",
+        payload={"mode": payload.mode, "request_id": ctx.request_id},
+    )
+    return {"session_id": session_id, "federation_id": federation_id, "status": "open"}
+
+
+@app.post("/v1/federations/sessions/{session_id}/join")
+def join_federation_session(
+    session_id: str,
+    payload: FederationJoinRequest,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> dict:
+    session = (
+        db.query(FederationSessionModel)
+        .filter(FederationSessionModel.session_id == session_id, FederationSessionModel.tenant_id == ctx.tenant_id)
+        .first()
+    )
+    if session is None:
+        raise HTTPException(status_code=404, detail="Federation session not found")
+    if session.status != "open":
+        raise HTTPException(status_code=409, detail="Federation session is closed")
+    db.add(
+        FederationSessionSubmissionModel(
+            session_id=session_id,
+            tenant_id=ctx.tenant_id,
+            parliament_name=payload.parliament_name,
+            position=payload.position,
+            confidence=payload.confidence,
+            summary=payload.summary,
+            weight=payload.weight,
+            submitted_by=ctx.user_id,
+            submitted_at=datetime.now(UTC).isoformat(),
+        )
+    )
+    db.commit()
+    audit_store.append(
+        db=db,
+        tenant_id=ctx.tenant_id,
+        actor_id=ctx.user_id,
+        action="federation.session.join",
+        resource=f"federations/sessions/{session_id}",
+        payload={"parliament_name": payload.parliament_name, "request_id": ctx.request_id},
+    )
+    return {"session_id": session_id, "joined": True, "parliament_name": payload.parliament_name}
+
+
+@app.get("/v1/federations/sessions/{session_id}/decision")
+def federation_session_decision(
+    session_id: str,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> dict:
+    session = (
+        db.query(FederationSessionModel)
+        .filter(FederationSessionModel.session_id == session_id, FederationSessionModel.tenant_id == ctx.tenant_id)
+        .first()
+    )
+    if session is None:
+        raise HTTPException(status_code=404, detail="Federation session not found")
+    submissions = (
+        db.query(FederationSessionSubmissionModel)
+        .filter(
+            FederationSessionSubmissionModel.session_id == session_id,
+            FederationSessionSubmissionModel.tenant_id == ctx.tenant_id,
+        )
+        .all()
+    )
+    if not submissions:
+        return {
+            "session_id": session_id,
+            "federation_id": session.federation_id,
+            "decision": "INCONCLUSIVE",
+            "confidence": "low",
+            "reason": "No submissions yet",
+            "submissions": 0,
+        }
+
+    score = 0.0
+    total_weight = 0.0
+    for submission in submissions:
+        stance = 1 if submission.position == "APPROVED" else -1 if submission.position == "REJECTED" else 0
+        weighted = stance * submission.confidence * submission.weight
+        score += weighted
+        total_weight += submission.weight
+    normalized = score / total_weight if total_weight > 0 else 0.0
+    decision = "APPROVED" if normalized > 0.15 else "REJECTED" if normalized < -0.15 else "INCONCLUSIVE"
+    confidence = "high" if abs(normalized) > 0.7 else "medium" if abs(normalized) > 0.35 else "low"
+    dissent = [s.parliament_name for s in submissions if (decision == "APPROVED" and s.position != "APPROVED")]
+    if decision == "REJECTED":
+        dissent = [s.parliament_name for s in submissions if s.position != "REJECTED"]
+    audit_store.append(
+        db=db,
+        tenant_id=ctx.tenant_id,
+        actor_id=ctx.user_id,
+        action="federation.session.decision.read",
+        resource=f"federations/sessions/{session_id}/decision",
+        payload={"submissions": len(submissions), "request_id": ctx.request_id},
+    )
+    return {
+        "session_id": session_id,
+        "federation_id": session.federation_id,
+        "decision": decision,
+        "confidence": confidence,
+        "score": round(normalized, 4),
+        "submissions": len(submissions),
+        "dissenting_parliaments": dissent,
+    }
 
 
 @app.post("/v1/debates/{debate_id}/approve", response_model=DebateApproveResponse)
