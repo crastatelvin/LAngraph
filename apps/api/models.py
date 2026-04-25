@@ -95,6 +95,21 @@ class AgentProfileVersionModel(Base):
     created_at: Mapped[str] = mapped_column(String(64))
 
 
+class AgentOutcomeModel(Base):
+    __tablename__ = "agent_outcomes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    agent_id: Mapped[str] = mapped_column(String(64), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    debate_id: Mapped[str] = mapped_column(String(64), index=True)
+    outcome_score: Mapped[float] = mapped_column(Float())
+    predicted_confidence: Mapped[float] = mapped_column(Float())
+    actual_score: Mapped[float] = mapped_column(Float())
+    notes: Mapped[str] = mapped_column(Text(), default="")
+    created_by: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[str] = mapped_column(String(64))
+
+
 class FederationModel(Base):
     __tablename__ = "federations"
 

@@ -8,8 +8,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from apps.api.main import app
-from apps.api.db import SessionLocal
-from apps.api.models import AgentProfileModel, AgentProfileVersionModel
+from apps.api.db import Base, SessionLocal, engine
+from apps.api.models import AgentOutcomeModel, AgentProfileModel, AgentProfileVersionModel
 
 HEADERS = {
     "X-Tenant-Id": "tenant-int-001",
@@ -26,7 +26,9 @@ MEMBER_HEADERS = {
 
 
 def _reset_agent_tables() -> None:
+    Base.metadata.create_all(bind=engine)
     db = SessionLocal()
+    db.query(AgentOutcomeModel).delete()
     db.query(AgentProfileVersionModel).delete()
     db.query(AgentProfileModel).delete()
     db.commit()
@@ -77,3 +79,43 @@ def test_recalibrate_agent() -> None:
         assert payload["agent_id"] == "agent-003"
         assert payload["version"] == 2
         assert payload["calibration_score"] >= 0.55
+
+
+def test_agent_outcome_evolve_and_rollback() -> None:
+    _reset_agent_tables()
+    with TestClient(app) as client:
+        seed = client.patch(
+            "/v1/agents/agent-004",
+            json={"traits": {"risk_tolerance": 0.4, "reliability": 0.5}, "reason": "seed"},
+            headers=HEADERS,
+        )
+        assert seed.status_code == 200
+
+        outcome = client.post(
+            "/v1/agents/agent-004/outcomes",
+            json={
+                "debate_id": "debate-900",
+                "predicted_confidence": 0.4,
+                "actual_score": 0.8,
+                "notes": "Strong positive result",
+            },
+            headers=HEADERS,
+        )
+        assert outcome.status_code == 200
+        assert outcome.json()["outcome_score"] > 0
+
+        evolve = client.post(
+            "/v1/agents/agent-004/evolve",
+            json={"max_delta": 0.1, "reason": "auto_evolve_cycle"},
+            headers=HEADERS,
+        )
+        assert evolve.status_code == 200
+        evolved = evolve.json()
+        assert evolved["agent"]["version"] == 2
+        assert evolved["evolution"]["outcome_count"] >= 1
+
+        rollback = client.post("/v1/agents/agent-004/rollback/1", headers=HEADERS)
+        assert rollback.status_code == 200
+        rolled = rollback.json()
+        assert rolled["rollback"]["target_version"] == 1
+        assert rolled["agent"]["version"] == 3

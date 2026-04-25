@@ -23,6 +23,7 @@ from apps.api.db import Base, engine, get_db
 from apps.api.metrics import WorkflowMetricsStore
 from apps.api.request_metrics import EndpointMetricsStore
 from apps.api.models import (
+    AgentOutcomeModel,
     AgentProfileModel,
     AgentProfileVersionModel,
     ChainAnchorModel,
@@ -86,6 +87,18 @@ class AgentPatchRequest(BaseModel):
     reason: str = Field(default="manual_update", min_length=3, max_length=256)
 
 
+class AgentOutcomeIngestRequest(BaseModel):
+    debate_id: str = Field(min_length=3, max_length=64)
+    predicted_confidence: float = Field(ge=0.0, le=1.0)
+    actual_score: float = Field(ge=0.0, le=1.0)
+    notes: str = Field(default="", max_length=2000)
+
+
+class AgentEvolveRequest(BaseModel):
+    max_delta: float = Field(default=0.1, ge=0.01, le=0.25)
+    reason: str = Field(default="evolution_cycle", min_length=3, max_length=256)
+
+
 class FederationCreateRequest(BaseModel):
     name: str = Field(min_length=3, max_length=128)
 
@@ -142,6 +155,14 @@ def _to_agent_record(row: AgentProfileModel) -> AgentRecord:
         version=row.version,
         updated_at=row.updated_at,
     )
+
+
+def _coerce_numeric_traits(traits: dict) -> dict[str, float]:
+    numeric: dict[str, float] = {}
+    for key, value in traits.items():
+        if isinstance(value, (int, float)):
+            numeric[key] = float(value)
+    return numeric
 
 
 @app.middleware("http")
@@ -384,6 +405,201 @@ def recalibrate_agent(
         payload={"version": row.version, "request_id": ctx.request_id},
     )
     return _to_agent_record(row).model_dump()
+
+
+@app.post("/v1/agents/{agent_id}/outcomes")
+def ingest_agent_outcome(
+    agent_id: str,
+    payload: AgentOutcomeIngestRequest,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> dict:
+    require_roles(ctx, {"admin", "owner"})
+    row = (
+        db.query(AgentProfileModel)
+        .filter(AgentProfileModel.agent_id == agent_id, AgentProfileModel.tenant_id == ctx.tenant_id)
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    outcome_score = round(max(0.0, 1.0 - abs(payload.predicted_confidence - payload.actual_score)), 4)
+    record = AgentOutcomeModel(
+        agent_id=agent_id,
+        tenant_id=ctx.tenant_id,
+        debate_id=payload.debate_id,
+        outcome_score=outcome_score,
+        predicted_confidence=payload.predicted_confidence,
+        actual_score=payload.actual_score,
+        notes=payload.notes,
+        created_by=ctx.user_id,
+        created_at=datetime.now(UTC).isoformat(),
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    audit_store.append(
+        db=db,
+        tenant_id=ctx.tenant_id,
+        actor_id=ctx.user_id,
+        action="agent.outcome.ingest",
+        resource=f"agents/{agent_id}/outcomes/{record.id}",
+        payload={"debate_id": payload.debate_id, "outcome_score": outcome_score, "request_id": ctx.request_id},
+    )
+    return {
+        "outcome_id": record.id,
+        "agent_id": agent_id,
+        "debate_id": record.debate_id,
+        "outcome_score": record.outcome_score,
+    }
+
+
+@app.post("/v1/agents/{agent_id}/evolve")
+def evolve_agent(
+    agent_id: str,
+    payload: AgentEvolveRequest,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> dict:
+    require_roles(ctx, {"admin", "owner"})
+    row = (
+        db.query(AgentProfileModel)
+        .filter(AgentProfileModel.agent_id == agent_id, AgentProfileModel.tenant_id == ctx.tenant_id)
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    outcomes = (
+        db.query(AgentOutcomeModel)
+        .filter(AgentOutcomeModel.agent_id == agent_id, AgentOutcomeModel.tenant_id == ctx.tenant_id)
+        .order_by(AgentOutcomeModel.id.desc())
+        .limit(20)
+        .all()
+    )
+    if not outcomes:
+        raise HTTPException(status_code=400, detail="No outcomes available for evolution")
+
+    avg_pred = sum(item.predicted_confidence for item in outcomes) / len(outcomes)
+    avg_actual = sum(item.actual_score for item in outcomes) / len(outcomes)
+    drift = avg_actual - avg_pred
+    bounded_delta = max(-payload.max_delta, min(payload.max_delta, drift * 0.2))
+
+    current_traits = json.loads(row.traits_json)
+    numeric_traits = _coerce_numeric_traits(current_traits)
+    if not numeric_traits:
+        numeric_traits = {"reliability": 0.5}
+    updated_numeric_traits: dict[str, float] = {}
+    for key, value in numeric_traits.items():
+        updated_numeric_traits[key] = round(max(0.0, min(1.0, value + bounded_delta)), 4)
+    updated_traits = {**current_traits, **updated_numeric_traits}
+
+    db.add(
+        AgentProfileVersionModel(
+            agent_id=row.agent_id,
+            tenant_id=row.tenant_id,
+            version=row.version,
+            traits_json=row.traits_json,
+            calibration_score=row.calibration_score,
+            reason=payload.reason,
+            created_at=datetime.now(UTC).isoformat(),
+        )
+    )
+    row.version += 1
+    row.traits_json = json.dumps(updated_traits)
+    row.calibration_score = round(max(0.0, min(1.0, row.calibration_score + (drift * 0.1))), 4)
+    row.updated_at = datetime.now(UTC).isoformat()
+    db.commit()
+    db.refresh(row)
+    audit_store.append(
+        db=db,
+        tenant_id=ctx.tenant_id,
+        actor_id=ctx.user_id,
+        action="agent.evolve",
+        resource=f"agents/{agent_id}",
+        payload={
+            "version": row.version,
+            "drift": round(drift, 4),
+            "bounded_delta": round(bounded_delta, 4),
+            "request_id": ctx.request_id,
+        },
+    )
+    return {
+        "agent": _to_agent_record(row).model_dump(),
+        "evolution": {
+            "outcome_count": len(outcomes),
+            "avg_predicted_confidence": round(avg_pred, 4),
+            "avg_actual_score": round(avg_actual, 4),
+            "drift": round(drift, 4),
+            "applied_delta": round(bounded_delta, 4),
+        },
+    }
+
+
+@app.post("/v1/agents/{agent_id}/rollback/{version}")
+def rollback_agent_version(
+    agent_id: str,
+    version: int,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> dict:
+    require_roles(ctx, {"admin", "owner"})
+    row = (
+        db.query(AgentProfileModel)
+        .filter(AgentProfileModel.agent_id == agent_id, AgentProfileModel.tenant_id == ctx.tenant_id)
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    target = (
+        db.query(AgentProfileVersionModel)
+        .filter(
+            AgentProfileVersionModel.agent_id == agent_id,
+            AgentProfileVersionModel.tenant_id == ctx.tenant_id,
+            AgentProfileVersionModel.version == version,
+        )
+        .first()
+    )
+    if target is None:
+        raise HTTPException(status_code=404, detail="Target version not found")
+
+    current_version = row.version
+    db.add(
+        AgentProfileVersionModel(
+            agent_id=row.agent_id,
+            tenant_id=row.tenant_id,
+            version=row.version,
+            traits_json=row.traits_json,
+            calibration_score=row.calibration_score,
+            reason=f"rollback_before_{version}",
+            created_at=datetime.now(UTC).isoformat(),
+        )
+    )
+    row.version = current_version + 1
+    row.traits_json = target.traits_json
+    row.calibration_score = target.calibration_score
+    row.updated_at = datetime.now(UTC).isoformat()
+    db.commit()
+    db.refresh(row)
+    audit_store.append(
+        db=db,
+        tenant_id=ctx.tenant_id,
+        actor_id=ctx.user_id,
+        action="agent.rollback",
+        resource=f"agents/{agent_id}",
+        payload={
+            "rolled_back_from_version": current_version,
+            "target_version": version,
+            "new_version": row.version,
+            "request_id": ctx.request_id,
+        },
+    )
+    return {
+        "agent": _to_agent_record(row).model_dump(),
+        "rollback": {
+            "target_version": version,
+            "rolled_back_from_version": current_version,
+            "new_version": row.version,
+        },
+    }
 
 
 @app.post("/v1/federations")
