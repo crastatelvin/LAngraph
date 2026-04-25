@@ -1,0 +1,66 @@
+:root {
+  color-scheme: dark;
+  font-family: Inter, Segoe UI, Roboto, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: #0b1020;
+  color: #e6ecff;
+}
+
+a {
+  color: #92b4ff;
+  text-decoration: none;
+}
+
+.container {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.card {
+  border: 1px solid #243053;
+  background: #131a31;
+  border-radius: 12px;
+  padding: 16px;
+}
+
+.grid {
+  display: grid;
+  gap: 16px;
+}
+
+.grid-2 {
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+}
+
+.input,
+.textarea,
+.button,
+.select {
+  width: 100%;
+  border-radius: 8px;
+  border: 1px solid #2f3f71;
+  background: #0f1730;
+  color: #e6ecff;
+  padding: 10px 12px;
+}
+
+.button {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.button.primary {
+  background: #2446a8;
+}
+
+.muted {
+  color: #a8b5da;
+}
