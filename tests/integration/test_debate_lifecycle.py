@@ -75,6 +75,7 @@ def test_not_found_paths() -> None:
         assert client.get(f"/v1/debates/{missing_id}", headers=HEADERS).status_code == 404
         assert client.get(f"/v1/debates/{missing_id}/events", headers=HEADERS).status_code == 404
         assert client.post(f"/v1/debates/{missing_id}/approve", headers=HEADERS).status_code == 404
+        assert client.post(f"/v1/debates/{missing_id}/reject", headers=HEADERS).status_code == 404
         assert client.get(f"/v1/debates/{missing_id}/stream", headers=HEADERS).status_code == 404
 
 

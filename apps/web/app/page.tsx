@@ -15,12 +15,14 @@ import {
   getFederationDecision,
   getSlackOutboundStatus,
   getTxStatus,
+  getChainQueueStatus,
   ingestAgentOutcome,
   listAgents,
   patchAgent,
   recalibrateAgent,
   rollbackAgent,
   joinFederationSession,
+  flushChainQueue,
 } from "../lib/api";
 
 export default function DashboardPage() {
@@ -35,6 +37,8 @@ export default function DashboardPage() {
   const [chainDebateId, setChainDebateId] = useState("");
   const [reportHash, setReportHash] = useState("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
   const [txHash, setTxHash] = useState("");
+  const [deferredAnchor, setDeferredAnchor] = useState(false);
+  const [chainQueueMaxItems, setChainQueueMaxItems] = useState("20");
   const [chainOutput, setChainOutput] = useState<Record<string, unknown> | null>(null);
   const [agentId, setAgentId] = useState("agent-web-001");
   const [agentTraitsText, setAgentTraitsText] = useState('{"risk_tolerance": 0.4, "priority": "reliability"}');
@@ -113,8 +117,10 @@ export default function DashboardPage() {
         setError("Provide debate id for anchoring");
         return;
       }
-      const response = await anchorDecision(debateId, reportHash);
-      setTxHash(String(response.tx_hash || ""));
+      const response = await anchorDecision(debateId, reportHash, "testnet", deferredAnchor);
+      if ("tx_hash" in response) {
+        setTxHash(String(response.tx_hash || ""));
+      }
       setChainOutput(response);
       setError("");
     } catch (err) {
@@ -129,6 +135,27 @@ export default function DashboardPage() {
       setError("");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to fetch tx status");
+    }
+  }
+
+  async function onChainQueueStatus() {
+    try {
+      const response = await getChainQueueStatus();
+      setChainOutput(response);
+      setError("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to fetch chain queue status");
+    }
+  }
+
+  async function onChainQueueFlush() {
+    try {
+      const maxItems = Number(chainQueueMaxItems || "20");
+      const response = await flushChainQueue(maxItems);
+      setChainOutput(response);
+      setError("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to flush chain queue");
     }
   }
 
@@ -332,6 +359,9 @@ export default function DashboardPage() {
             <button className="button" onClick={onGetDecision} disabled={!sessionId}>
               Get Decision
             </button>
+            <Link href={sessionId ? `/federations/${sessionId}` : "#"} style={{ alignSelf: "center" }}>
+              Open Session View
+            </Link>
           </div>
         </section>
 
@@ -353,8 +383,16 @@ export default function DashboardPage() {
           />
           <div style={{ marginTop: 8, display: "flex", gap: 8 }}>
             <button className="button" onClick={onAnchor} disabled={reportHash.length < 16}>
-              Anchor Decision
+              {deferredAnchor ? "Queue Anchor Job" : "Anchor Decision"}
             </button>
+            <label className="muted" style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <input
+                type="checkbox"
+                checked={deferredAnchor}
+                onChange={(event) => setDeferredAnchor(event.target.checked)}
+              />
+              Deferred queue mode
+            </label>
           </div>
           <input
             className="input"
@@ -366,6 +404,21 @@ export default function DashboardPage() {
           <div style={{ marginTop: 8, display: "flex", gap: 8 }}>
             <button className="button" onClick={onTxStatus} disabled={!txHash}>
               Get TX Status
+            </button>
+          </div>
+          <div style={{ marginTop: 8, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <button className="button" onClick={onChainQueueStatus}>
+              Queue Status
+            </button>
+            <input
+              className="input"
+              style={{ maxWidth: 140 }}
+              value={chainQueueMaxItems}
+              onChange={(event) => setChainQueueMaxItems(event.target.value)}
+              placeholder="max_items"
+            />
+            <button className="button" onClick={onChainQueueFlush}>
+              Flush Chain Queue
             </button>
           </div>
         </section>
@@ -398,6 +451,9 @@ export default function DashboardPage() {
           <button className="button" onClick={onRecalibrateAgent} disabled={!agentId}>
             Recalibrate
           </button>
+          <Link href={agentId ? `/agents/${agentId}` : "#"} style={{ alignSelf: "center" }}>
+            Open Agent View
+          </Link>
         </div>
         <input
           className="input"

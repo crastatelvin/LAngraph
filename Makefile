@@ -1,4 +1,4 @@
-.PHONY: help up down logs test migrate api worker
+.PHONY: help up down logs test load-smoke migrate api worker
 
 help:
 	@echo "Available targets:"
@@ -6,6 +6,7 @@ help:
 	@echo "  make down     - Stop Docker Compose services"
 	@echo "  make logs     - Follow Docker Compose logs"
 	@echo "  make test     - Run integration test suite"
+	@echo "  make load-smoke - Run non-functional load smoke tests"
 	@echo "  make migrate  - Apply Alembic migrations"
 	@echo "  make api      - Run API locally with uvicorn"
 	@echo "  make worker   - Run Slack outbound worker locally"
@@ -21,6 +22,9 @@ logs:
 
 test:
 	pytest tests/integration -q
+
+load-smoke:
+	pytest tests/nonfunctional -q
 
 migrate:
 	alembic upgrade head

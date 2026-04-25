@@ -21,3 +21,9 @@ jobs:
 
       - name: Run tests
         run: pytest tests/integration -q
+
+      - name: Run security harness
+        run: pytest tests/integration/test_security_harness.py -q
+
+      - name: Run load smoke harness
+        run: pytest tests/nonfunctional -q

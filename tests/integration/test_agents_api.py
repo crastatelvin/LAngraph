@@ -119,3 +119,15 @@ def test_agent_outcome_evolve_and_rollback() -> None:
         rolled = rollback.json()
         assert rolled["rollback"]["target_version"] == 1
         assert rolled["agent"]["version"] == 3
+
+        outcomes = client.get("/v1/agents/agent-004/outcomes", headers=HEADERS)
+        assert outcomes.status_code == 200
+        outcomes_payload = outcomes.json()
+        assert outcomes_payload["count"] >= 1
+        assert outcomes_payload["outcomes"][0]["debate_id"] == "debate-900"
+
+        versions = client.get("/v1/agents/agent-004/versions", headers=HEADERS)
+        assert versions.status_code == 200
+        versions_payload = versions.json()
+        assert versions_payload["count"] >= 2
+        assert versions_payload["versions"][0]["reason"] == "current_profile"

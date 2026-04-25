@@ -9,7 +9,7 @@ if str(ROOT) not in sys.path:
 
 from apps.api.main import app
 from apps.api.db import Base, SessionLocal, engine
-from apps.api.models import ChainAnchorModel
+from apps.api.models import ChainAnchorJobModel, ChainAnchorModel
 
 HEADERS = {
     "X-Tenant-Id": "tenant-chain-001",
@@ -28,6 +28,7 @@ MEMBER_HEADERS = {
 def _reset_chain_table() -> None:
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
+    db.query(ChainAnchorJobModel).delete()
     db.query(ChainAnchorModel).delete()
     db.commit()
     db.close()
@@ -74,3 +75,31 @@ def test_chain_endpoints_require_admin() -> None:
             headers=MEMBER_HEADERS,
         )
         assert denied.status_code == 403
+
+
+def test_deferred_anchor_queue_and_flush() -> None:
+    _reset_chain_table()
+    with TestClient(app) as client:
+        queued = client.post(
+            "/v1/chain/anchor-decision",
+            json={"debate_id": "debate-queued", "report_hash": "d" * 32, "network": "testnet", "deferred": True},
+            headers=HEADERS,
+        )
+        assert queued.status_code == 200
+        queued_payload = queued.json()
+        assert queued_payload["queued"] is True
+        assert queued_payload["status"] == "queued"
+
+        status_before = client.get("/v1/chain/queue/status", headers=HEADERS)
+        assert status_before.status_code == 200
+        assert status_before.json()["queued"] >= 1
+
+        flushed = client.post("/v1/chain/queue/flush?max_items=10", headers=HEADERS)
+        assert flushed.status_code == 200
+        flush_payload = flushed.json()
+        assert flush_payload["processed"] >= 1
+        assert flush_payload["submitted"] >= 1
+
+        status_after = client.get("/v1/chain/queue/status", headers=HEADERS)
+        assert status_after.status_code == 200
+        assert status_after.json()["submitted"] >= 1

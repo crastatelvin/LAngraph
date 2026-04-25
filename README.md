@@ -48,6 +48,62 @@ docs/
 Run outbound Slack queue worker:
 - `python -m apps.worker.slack_outbound_worker`
 
+## Slack Integration Cookbook
+
+### 1) Configure environment
+
+Set the following in `.env`:
+- `ENABLE_SLACK_INTEGRATION=true`
+- `SLACK_SIGNING_SECRET=<from Slack app settings>`
+- `SLACK_BOT_TOKEN=<xoxb token>`
+- `FEDERATION_SLACK_CHANNEL=<optional channel id for federation queue updates>`
+
+Then start API + worker:
+- `uvicorn apps.api.main:app --reload --port 8000`
+- `python -m apps.worker.slack_outbound_worker`
+
+### 2) Slack request URLs
+
+Point Slack app endpoints to your API:
+- Events: `POST /v1/integrations/slack/events`
+- Slash commands: `POST /v1/integrations/slack/commands`
+- Interactions: `POST /v1/integrations/slack/interactions`
+
+### 3) Debate flow commands
+
+- `/debate <proposal text>`
+  - Creates debate under tenant `slack-<team_id>`
+  - Returns interactive buttons:
+    - `Approve` -> approves debate
+    - `Reject` -> rejects debate
+
+### 4) Federation flow commands
+
+- `/federation create-session <federation_id>`
+  - Creates open federation session
+  - Returns stance buttons:
+    - `Approve`
+    - `Reject`
+    - `Inconclusive`
+
+- `/federation decision <session_id>`
+  - Returns latest consensus snapshot:
+    - decision
+    - confidence
+    - submission count
+
+- `/federation submissions <session_id>`
+  - Returns compact submission history summary (position/confidence/weight).
+
+### 5) Operational checks
+
+- Queue status:
+  - `GET /v1/integrations/slack/outbound/status`
+- Force flush:
+  - `POST /v1/integrations/slack/outbound/flush`
+- Cleanup old Slack state:
+  - `POST /v1/admin/slack/cleanup`
+
 ## Quickstart (Docker Compose)
 
 Run API + worker together:
@@ -65,9 +121,23 @@ You can also pass env values to Compose via:
 - `make down` -> stop services
 - `make logs` -> stream service logs
 - `make test` -> run integration tests
+- `make load-smoke` -> run non-functional load smoke tests
 - `make migrate` -> run Alembic migrations
 - `make api` -> run API locally
 - `make worker` -> run Slack outbound worker locally
+
+## Load Smoke Harness
+
+A lightweight non-functional baseline is included in:
+- `tests/nonfunctional/test_load_smoke.py`
+
+Current smoke coverage:
+- Health endpoint p95 latency check
+- Debate creation success-rate + average latency check
+
+Run locally:
+- `pytest tests/nonfunctional -q`
+- or `make load-smoke`
 
 ## Database Migrations
 
@@ -83,7 +153,23 @@ Please read:
 - `TASKS.md`
 - `AI_PARLIAMENT_COMPLETE_HANDOFF.md`
 - `docs/adr/*`
+- `docs/runbooks/canary_rollback_drill.md`
+- `docs/runbooks/incident_postmortem_template.md`
 - `CONTRIBUTING.md`
+
+## Canary and Rollback Drill
+
+A manual drill workflow is available:
+- `.github/workflows/canary-rollback-drill.yml`
+
+Use it to run:
+- integration gates
+- security harness
+- load smoke harness
+- simulated canary promotion and rollback branches
+
+Operational guide:
+- `docs/runbooks/canary_rollback_drill.md`
 
 ## Roadmap
 

@@ -114,3 +114,30 @@ class DebateStore:
         )
         db.commit()
         return DebateRecord(debate_id=debate.debate_id, proposal=debate.proposal, status=debate.status)
+
+    def reject(self, db: Session, debate_id: str, tenant_id: str) -> DebateRecord | None:
+        debate = (
+            db.query(DebateModel)
+            .filter(DebateModel.debate_id == debate_id, DebateModel.tenant_id == tenant_id)
+            .first()
+        )
+        if debate is None:
+            return None
+        debate.status = "rejected"
+        seq = (
+            db.query(DebateEventModel)
+            .filter(DebateEventModel.debate_id == debate_id, DebateEventModel.tenant_id == tenant_id)
+            .count()
+            + 1
+        )
+        db.add(
+            DebateEventModel(
+                debate_id=debate_id,
+                tenant_id=tenant_id,
+                seq=seq,
+                event_type="human_rejected",
+                payload_json=json.dumps({"status": "rejected"}),
+            )
+        )
+        db.commit()
+        return DebateRecord(debate_id=debate.debate_id, proposal=debate.proposal, status=debate.status)

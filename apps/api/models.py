@@ -162,3 +162,48 @@ class ChainAnchorModel(Base):
     created_at: Mapped[str] = mapped_column(String(64))
     updated_at: Mapped[str] = mapped_column(String(64))
 
+
+class ChainAnchorJobModel(Base):
+    __tablename__ = "chain_anchor_jobs"
+
+    job_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    debate_id: Mapped[str] = mapped_column(String(64), index=True)
+    report_hash: Mapped[str] = mapped_column(String(128), index=True)
+    network: Mapped[str] = mapped_column(String(64))
+    requested_by: Mapped[str] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    tx_hash: Mapped[str] = mapped_column(String(128), nullable=True, index=True)
+    last_error: Mapped[str] = mapped_column(Text(), nullable=True)
+    created_at: Mapped[str] = mapped_column(String(64))
+    updated_at: Mapped[str] = mapped_column(String(64))
+
+
+class UsageEventModel(Base):
+    __tablename__ = "usage_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    actor_id: Mapped[str] = mapped_column(String(128), index=True)
+    event_type: Mapped[str] = mapped_column(String(128), index=True)
+    quantity: Mapped[float] = mapped_column(Float(), default=1.0)
+    unit: Mapped[str] = mapped_column(String(32), default="count")
+    metadata_json: Mapped[str] = mapped_column(Text(), default="{}")
+    created_at: Mapped[str] = mapped_column(String(64), index=True)
+
+
+class ApiKeyModel(Base):
+    __tablename__ = "api_keys"
+
+    key_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    name: Mapped[str] = mapped_column(String(128))
+    key_prefix: Mapped[str] = mapped_column(String(32), index=True)
+    key_hash: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    scopes_json: Mapped[str] = mapped_column(Text(), default="[]")
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    created_by: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[str] = mapped_column(String(64))
+    revoked_at: Mapped[str] = mapped_column(String(64), nullable=True)
+

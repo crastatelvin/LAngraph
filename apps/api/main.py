@@ -1,8 +1,11 @@
 from dataclasses import asdict
 from contextlib import asynccontextmanager
+import hashlib
 import json
 import logging
 import os
+import re
+import secrets
 import time
 from datetime import UTC, datetime
 from uuid import uuid4
@@ -17,21 +20,25 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from apps.api.audit import AuditStore
-from apps.api.chain import get_chain_adapter, refresh_tx_status
+from apps.api.chain import get_chain_adapter, process_anchor_jobs, queue_status, refresh_tx_status
 from apps.api.context import RequestContext, get_request_context, require_roles
-from apps.api.db import Base, engine, get_db
+from apps.api.db import Base, SessionLocal, engine, get_db
 from apps.api.metrics import WorkflowMetricsStore
 from apps.api.request_metrics import EndpointMetricsStore
 from apps.api.models import (
     AgentOutcomeModel,
+    ApiKeyModel,
     AgentProfileModel,
     AgentProfileVersionModel,
+    AuditEventModel,
     ChainAnchorModel,
+    ChainAnchorJobModel,
     DebateModel,
     FederationModel,
     FederationSessionModel,
     FederationSessionSubmissionModel,
     SlackOutboundMessageModel,
+    UsageEventModel,
 )
 from apps.api.store import DebateStore
 from apps.api.slack import SlackIntegration
@@ -68,6 +75,7 @@ SECURITY_HEADERS = {
     "Referrer-Policy": "no-referrer",
     "X-XSS-Protection": "1; mode=block",
 }
+PLAN_LIMIT_WINDOW_HOURS = int(os.getenv("PLAN_LIMIT_WINDOW_HOURS", "24"))
 
 
 class AgentRecord(BaseModel):
@@ -119,6 +127,12 @@ class AnchorDecisionRequest(BaseModel):
     debate_id: str = Field(min_length=3, max_length=64)
     report_hash: str = Field(min_length=16, max_length=128)
     network: str = Field(default="testnet", min_length=3, max_length=64)
+    deferred: bool = Field(default=False)
+
+
+class ApiKeyCreateRequest(BaseModel):
+    name: str = Field(min_length=3, max_length=128)
+    scopes: list[str] = Field(default_factory=lambda: ["read:debates", "write:debates"])
 
 
 def _queue_counts(db: Session, tenant_id: str | None = None) -> tuple[int, int]:
@@ -143,6 +157,114 @@ def _slack_tenant_from_payload(payload: dict) -> str:
     return f"slack-{resolved}"
 
 
+def _queue_federation_slack_update(
+    db: Session,
+    tenant_id: str,
+    text: str,
+    dedupe_key: str,
+) -> None:
+    channel = os.getenv("FEDERATION_SLACK_CHANNEL", "").strip()
+    if not channel or not slack_integration.enabled():
+        return
+    slack_integration.queue_thread_message(
+        db=db,
+        tenant_id=tenant_id,
+        channel=channel,
+        text=text,
+        dedupe_key=dedupe_key,
+    )
+
+
+def _compute_federation_decision(
+    session_id: str,
+    tenant_id: str,
+    db: Session,
+) -> dict | None:
+    session = (
+        db.query(FederationSessionModel)
+        .filter(FederationSessionModel.session_id == session_id, FederationSessionModel.tenant_id == tenant_id)
+        .first()
+    )
+    if session is None:
+        return None
+    submissions = (
+        db.query(FederationSessionSubmissionModel)
+        .filter(
+            FederationSessionSubmissionModel.session_id == session_id,
+            FederationSessionSubmissionModel.tenant_id == tenant_id,
+        )
+        .all()
+    )
+    if not submissions:
+        return {
+            "session_id": session_id,
+            "federation_id": session.federation_id,
+            "decision": "INCONCLUSIVE",
+            "confidence": "low",
+            "reason": "No submissions yet",
+            "submissions": 0,
+        }
+    score = 0.0
+    total_weight = 0.0
+    for submission in submissions:
+        stance = 1 if submission.position == "APPROVED" else -1 if submission.position == "REJECTED" else 0
+        weighted = stance * submission.confidence * submission.weight
+        score += weighted
+        total_weight += submission.weight
+    normalized = score / total_weight if total_weight > 0 else 0.0
+    decision = "APPROVED" if normalized > 0.15 else "REJECTED" if normalized < -0.15 else "INCONCLUSIVE"
+    confidence = "high" if abs(normalized) > 0.7 else "medium" if abs(normalized) > 0.35 else "low"
+    dissent = [s.parliament_name for s in submissions if (decision == "APPROVED" and s.position != "APPROVED")]
+    if decision == "REJECTED":
+        dissent = [s.parliament_name for s in submissions if s.position != "REJECTED"]
+    return {
+        "session_id": session_id,
+        "federation_id": session.federation_id,
+        "decision": decision,
+        "confidence": confidence,
+        "score": round(normalized, 4),
+        "submissions": len(submissions),
+        "dissenting_parliaments": dissent,
+    }
+
+
+def _list_federation_submissions(
+    session_id: str,
+    tenant_id: str,
+    db: Session,
+) -> dict | None:
+    session = (
+        db.query(FederationSessionModel)
+        .filter(FederationSessionModel.session_id == session_id, FederationSessionModel.tenant_id == tenant_id)
+        .first()
+    )
+    if session is None:
+        return None
+    rows = (
+        db.query(FederationSessionSubmissionModel)
+        .filter(
+            FederationSessionSubmissionModel.session_id == session_id,
+            FederationSessionSubmissionModel.tenant_id == tenant_id,
+        )
+        .order_by(FederationSessionSubmissionModel.id.asc())
+        .all()
+    )
+    payload = [
+        {
+            "id": item.id,
+            "parliament_name": item.parliament_name,
+            "position": item.position,
+            "confidence": item.confidence,
+            "weight": item.weight,
+            "summary": item.summary,
+            "submitted_by": item.submitted_by,
+            "submitted_at": item.submitted_at,
+        }
+        for item in rows
+    ]
+    return {"session_id": session_id, "federation_id": session.federation_id, "submissions": payload}
+
+
 def _to_agent_record(row: AgentProfileModel) -> AgentRecord:
     return AgentRecord(
         agent_id=row.agent_id,
@@ -165,6 +287,106 @@ def _coerce_numeric_traits(traits: dict) -> dict[str, float]:
     return numeric
 
 
+def _record_usage_event(
+    db: Session,
+    tenant_id: str,
+    actor_id: str,
+    event_type: str,
+    quantity: float = 1.0,
+    unit: str = "count",
+    metadata: dict | None = None,
+) -> None:
+    db.add(
+        UsageEventModel(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            event_type=event_type,
+            quantity=quantity,
+            unit=unit,
+            metadata_json=json.dumps(metadata or {}),
+            created_at=datetime.now(UTC).isoformat(),
+        )
+    )
+    db.commit()
+
+
+def _usage_summary(db: Session, tenant_id: str, since_hours: int = 24) -> dict:
+    capped_since = max(1, min(since_hours, 24 * 90))
+    cutoff_ts = time.time() - (capped_since * 3600)
+    cutoff_iso = datetime.fromtimestamp(cutoff_ts, UTC).isoformat()
+    rows = (
+        db.query(UsageEventModel)
+        .filter(UsageEventModel.tenant_id == tenant_id, UsageEventModel.created_at >= cutoff_iso)
+        .order_by(UsageEventModel.id.desc())
+        .all()
+    )
+    by_event: dict[str, float] = {}
+    for row in rows:
+        by_event[row.event_type] = by_event.get(row.event_type, 0.0) + float(row.quantity)
+    return {
+        "since_hours": capped_since,
+        "total_events": len(rows),
+        "by_event_type": by_event,
+    }
+
+
+def _resolve_plan_limits(tenant_id: str) -> dict:
+    defaults_raw = os.getenv(
+        "PLAN_LIMIT_DEFAULTS_JSON",
+        '{"plan":"pro","limits":{"debate_create_per_day":10000,"agent_outcome_ingest_per_day":10000,"chain_anchor_requests_per_day":10000}}',
+    )
+    overrides_raw = os.getenv("PLAN_LIMIT_OVERRIDES_JSON", "{}")
+    try:
+        defaults = json.loads(defaults_raw)
+    except json.JSONDecodeError:
+        defaults = {"plan": "pro", "limits": {}}
+    try:
+        overrides = json.loads(overrides_raw)
+    except json.JSONDecodeError:
+        overrides = {}
+    tenant_override = overrides.get(tenant_id, {})
+    plan_name = tenant_override.get("plan", defaults.get("plan", "pro"))
+    limits = dict(defaults.get("limits", {}))
+    limits.update(tenant_override.get("limits", {}))
+    return {"plan": plan_name, "limits": limits}
+
+
+def _usage_event_from_request(method: str, path: str) -> tuple[str, str] | None:
+    if method == "POST" and path == "/v1/debates":
+        return ("debate.create", "debate_create_per_day")
+    if method == "POST" and re.match(r"^/v1/agents/[^/]+/outcomes$", path):
+        return ("agent.outcome.ingest", "agent_outcome_ingest_per_day")
+    if method == "POST" and path == "/v1/chain/anchor-decision":
+        return ("chain.anchor", "chain_anchor_requests_per_day")
+    return None
+
+
+def _usage_count_for_limit(db: Session, tenant_id: str, event_type: str, since_iso: str) -> int:
+    if event_type == "chain.anchor":
+        return (
+            db.query(UsageEventModel)
+            .filter(
+                UsageEventModel.tenant_id == tenant_id,
+                UsageEventModel.event_type.in_(["chain.anchor.queue", "chain.anchor.immediate"]),
+                UsageEventModel.created_at >= since_iso,
+            )
+            .count()
+        )
+    return (
+        db.query(UsageEventModel)
+        .filter(
+            UsageEventModel.tenant_id == tenant_id,
+            UsageEventModel.event_type == event_type,
+            UsageEventModel.created_at >= since_iso,
+        )
+        .count()
+    )
+
+
+def _hash_api_key(raw_key: str) -> str:
+    return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+
 @app.middleware("http")
 async def observe_requests(request: Request, call_next):
     started = time.perf_counter()
@@ -184,6 +406,31 @@ async def observe_requests(request: Request, call_next):
         content_length = request.headers.get("content-length")
         if content_length and int(content_length) > MAX_REQUEST_BODY_BYTES:
             return JSONResponse(status_code=413, content={"detail": "Request body too large"})
+
+    usage_event = _usage_event_from_request(request.method, request.url.path)
+    if usage_event:
+        event_type, limit_key = usage_event
+        plan = _resolve_plan_limits(tenant_id)
+        limit_value = plan["limits"].get(limit_key)
+        if isinstance(limit_value, (int, float)) and limit_value >= 0:
+            cutoff_ts = time.time() - (PLAN_LIMIT_WINDOW_HOURS * 3600)
+            cutoff_iso = datetime.fromtimestamp(cutoff_ts, UTC).isoformat()
+            db = SessionLocal()
+            try:
+                current = _usage_count_for_limit(db, tenant_id=tenant_id, event_type=event_type, since_iso=cutoff_iso)
+            finally:
+                db.close()
+            if current >= int(limit_value):
+                return JSONResponse(
+                    status_code=402,
+                    content={
+                        "detail": "Plan limit exceeded",
+                        "plan": plan["plan"],
+                        "limit_key": limit_key,
+                        "limit": int(limit_value),
+                        "window_hours": PLAN_LIMIT_WINDOW_HOURS,
+                    },
+                )
 
     with tracer.start_as_current_span("http.request") as span:
         span.set_attribute("http.method", request.method)
@@ -237,6 +484,13 @@ def create_debate(
             "request_id": ctx.request_id,
             "workflow_metrics": workflow_metrics,
         },
+    )
+    _record_usage_event(
+        db=db,
+        tenant_id=ctx.tenant_id,
+        actor_id=ctx.user_id,
+        event_type="debate.create",
+        metadata={"debate_id": record.debate_id},
     )
     return DebateCreateResponse(
         debate_id=record.debate_id,
@@ -445,6 +699,13 @@ def ingest_agent_outcome(
         resource=f"agents/{agent_id}/outcomes/{record.id}",
         payload={"debate_id": payload.debate_id, "outcome_score": outcome_score, "request_id": ctx.request_id},
     )
+    _record_usage_event(
+        db=db,
+        tenant_id=ctx.tenant_id,
+        actor_id=ctx.user_id,
+        event_type="agent.outcome.ingest",
+        metadata={"agent_id": agent_id, "debate_id": payload.debate_id},
+    )
     return {
         "outcome_id": record.id,
         "agent_id": agent_id,
@@ -602,6 +863,107 @@ def rollback_agent_version(
     }
 
 
+@app.get("/v1/agents/{agent_id}/outcomes")
+def list_agent_outcomes(
+    agent_id: str,
+    limit: int = 50,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> dict:
+    capped_limit = max(1, min(limit, 200))
+    profile = (
+        db.query(AgentProfileModel)
+        .filter(AgentProfileModel.agent_id == agent_id, AgentProfileModel.tenant_id == ctx.tenant_id)
+        .first()
+    )
+    if profile is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    rows = (
+        db.query(AgentOutcomeModel)
+        .filter(AgentOutcomeModel.agent_id == agent_id, AgentOutcomeModel.tenant_id == ctx.tenant_id)
+        .order_by(AgentOutcomeModel.id.desc())
+        .limit(capped_limit)
+        .all()
+    )
+    payload = [
+        {
+            "id": item.id,
+            "debate_id": item.debate_id,
+            "outcome_score": item.outcome_score,
+            "predicted_confidence": item.predicted_confidence,
+            "actual_score": item.actual_score,
+            "notes": item.notes,
+            "created_by": item.created_by,
+            "created_at": item.created_at,
+        }
+        for item in rows
+    ]
+    audit_store.append(
+        db=db,
+        tenant_id=ctx.tenant_id,
+        actor_id=ctx.user_id,
+        action="agent.outcomes.list",
+        resource=f"agents/{agent_id}/outcomes",
+        payload={"count": len(payload), "request_id": ctx.request_id, "role": ctx.user_role},
+    )
+    return {"agent_id": agent_id, "count": len(payload), "outcomes": payload}
+
+
+@app.get("/v1/agents/{agent_id}/versions")
+def list_agent_versions(
+    agent_id: str,
+    limit: int = 50,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> dict:
+    capped_limit = max(1, min(limit, 200))
+    profile = (
+        db.query(AgentProfileModel)
+        .filter(AgentProfileModel.agent_id == agent_id, AgentProfileModel.tenant_id == ctx.tenant_id)
+        .first()
+    )
+    if profile is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    rows = (
+        db.query(AgentProfileVersionModel)
+        .filter(AgentProfileVersionModel.agent_id == agent_id, AgentProfileVersionModel.tenant_id == ctx.tenant_id)
+        .order_by(AgentProfileVersionModel.id.desc())
+        .limit(capped_limit)
+        .all()
+    )
+    payload = [
+        {
+            "id": item.id,
+            "version": item.version,
+            "traits": json.loads(item.traits_json),
+            "calibration_score": item.calibration_score,
+            "reason": item.reason,
+            "created_at": item.created_at,
+        }
+        for item in rows
+    ]
+    payload.insert(
+        0,
+        {
+            "id": 0,
+            "version": profile.version,
+            "traits": json.loads(profile.traits_json),
+            "calibration_score": profile.calibration_score,
+            "reason": "current_profile",
+            "created_at": profile.updated_at,
+        },
+    )
+    audit_store.append(
+        db=db,
+        tenant_id=ctx.tenant_id,
+        actor_id=ctx.user_id,
+        action="agent.versions.list",
+        resource=f"agents/{agent_id}/versions",
+        payload={"count": len(payload), "request_id": ctx.request_id, "role": ctx.user_role},
+    )
+    return {"agent_id": agent_id, "count": len(payload), "versions": payload}
+
+
 @app.post("/v1/federations")
 def create_federation(
     payload: FederationCreateRequest,
@@ -698,6 +1060,25 @@ def join_federation_session(
         )
     )
     db.commit()
+    latest_submission = (
+        db.query(FederationSessionSubmissionModel)
+        .filter(
+            FederationSessionSubmissionModel.session_id == session_id,
+            FederationSessionSubmissionModel.tenant_id == ctx.tenant_id,
+        )
+        .order_by(FederationSessionSubmissionModel.id.desc())
+        .first()
+    )
+    if latest_submission is not None:
+        _queue_federation_slack_update(
+            db=db,
+            tenant_id=ctx.tenant_id,
+            text=(
+                f"[Federation:{session_id}] {payload.parliament_name} submitted "
+                f"{payload.position} (confidence={payload.confidence:.2f}, weight={payload.weight:.2f})."
+            ),
+            dedupe_key=f"fed-session:{session_id}:submission:{latest_submission.id}",
+        )
     audit_store.append(
         db=db,
         tenant_id=ctx.tenant_id,
@@ -715,6 +1096,38 @@ def federation_session_decision(
     ctx: RequestContext = Depends(get_request_context),
     db: Session = Depends(get_db),
 ) -> dict:
+    result = _compute_federation_decision(session_id=session_id, tenant_id=ctx.tenant_id, db=db)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Federation session not found")
+    audit_store.append(
+        db=db,
+        tenant_id=ctx.tenant_id,
+        actor_id=ctx.user_id,
+        action="federation.session.decision.read",
+        resource=f"federations/sessions/{session_id}/decision",
+        payload={"submissions": result["submissions"], "request_id": ctx.request_id},
+    )
+    _queue_federation_slack_update(
+        db=db,
+        tenant_id=ctx.tenant_id,
+        text=(
+            f"[Federation:{session_id}] Decision={result['decision']} "
+            f"confidence={result['confidence']} score={result.get('score', 0.0)} submissions={result['submissions']}."
+        ),
+        dedupe_key=(
+            f"fed-session:{session_id}:decision:{result['decision']}:"
+            f"{result['confidence']}:{result.get('score', 0.0)}:{result['submissions']}"
+        ),
+    )
+    return result
+
+
+@app.get("/v1/federations/sessions/{session_id}/submissions")
+def federation_session_submissions(
+    session_id: str,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> dict:
     session = (
         db.query(FederationSessionModel)
         .filter(FederationSessionModel.session_id == session_id, FederationSessionModel.tenant_id == ctx.tenant_id)
@@ -728,48 +1141,31 @@ def federation_session_decision(
             FederationSessionSubmissionModel.session_id == session_id,
             FederationSessionSubmissionModel.tenant_id == ctx.tenant_id,
         )
+        .order_by(FederationSessionSubmissionModel.id.asc())
         .all()
     )
-    if not submissions:
-        return {
-            "session_id": session_id,
-            "federation_id": session.federation_id,
-            "decision": "INCONCLUSIVE",
-            "confidence": "low",
-            "reason": "No submissions yet",
-            "submissions": 0,
+    payload = [
+        {
+            "id": item.id,
+            "parliament_name": item.parliament_name,
+            "position": item.position,
+            "confidence": item.confidence,
+            "summary": item.summary,
+            "weight": item.weight,
+            "submitted_by": item.submitted_by,
+            "submitted_at": item.submitted_at,
         }
-
-    score = 0.0
-    total_weight = 0.0
-    for submission in submissions:
-        stance = 1 if submission.position == "APPROVED" else -1 if submission.position == "REJECTED" else 0
-        weighted = stance * submission.confidence * submission.weight
-        score += weighted
-        total_weight += submission.weight
-    normalized = score / total_weight if total_weight > 0 else 0.0
-    decision = "APPROVED" if normalized > 0.15 else "REJECTED" if normalized < -0.15 else "INCONCLUSIVE"
-    confidence = "high" if abs(normalized) > 0.7 else "medium" if abs(normalized) > 0.35 else "low"
-    dissent = [s.parliament_name for s in submissions if (decision == "APPROVED" and s.position != "APPROVED")]
-    if decision == "REJECTED":
-        dissent = [s.parliament_name for s in submissions if s.position != "REJECTED"]
+        for item in submissions
+    ]
     audit_store.append(
         db=db,
         tenant_id=ctx.tenant_id,
         actor_id=ctx.user_id,
-        action="federation.session.decision.read",
-        resource=f"federations/sessions/{session_id}/decision",
-        payload={"submissions": len(submissions), "request_id": ctx.request_id},
+        action="federation.session.submissions.read",
+        resource=f"federations/sessions/{session_id}/submissions",
+        payload={"count": len(payload), "request_id": ctx.request_id},
     )
-    return {
-        "session_id": session_id,
-        "federation_id": session.federation_id,
-        "decision": decision,
-        "confidence": confidence,
-        "score": round(normalized, 4),
-        "submissions": len(submissions),
-        "dissenting_parliaments": dissent,
-    }
+    return {"session_id": session_id, "federation_id": session.federation_id, "submissions": payload}
 
 
 @app.post("/v1/chain/anchor-decision")
@@ -779,6 +1175,59 @@ def anchor_decision(
     db: Session = Depends(get_db),
 ) -> dict:
     require_roles(ctx, {"admin", "owner"})
+    if payload.deferred:
+        existing_job = (
+            db.query(ChainAnchorJobModel)
+            .filter(
+                ChainAnchorJobModel.tenant_id == ctx.tenant_id,
+                ChainAnchorJobModel.debate_id == payload.debate_id,
+                ChainAnchorJobModel.report_hash == payload.report_hash,
+                ChainAnchorJobModel.network == payload.network,
+                ChainAnchorJobModel.status.in_(["queued", "retry", "processing"]),
+            )
+            .first()
+        )
+        if existing_job is not None:
+            return {
+                "queued": True,
+                "duplicate": True,
+                "job_id": existing_job.job_id,
+                "status": existing_job.status,
+            }
+        now_iso = datetime.now(UTC).isoformat()
+        job = ChainAnchorJobModel(
+            job_id=str(uuid4()),
+            tenant_id=ctx.tenant_id,
+            debate_id=payload.debate_id,
+            report_hash=payload.report_hash,
+            network=payload.network,
+            requested_by=ctx.user_id,
+            status="queued",
+            attempts=0,
+            tx_hash=None,
+            last_error=None,
+            created_at=now_iso,
+            updated_at=now_iso,
+        )
+        db.add(job)
+        db.commit()
+        audit_store.append(
+            db=db,
+            tenant_id=ctx.tenant_id,
+            actor_id=ctx.user_id,
+            action="chain.anchor.queue",
+            resource=f"chain/jobs/{job.job_id}",
+            payload={"debate_id": payload.debate_id, "network": payload.network, "request_id": ctx.request_id},
+        )
+        _record_usage_event(
+            db=db,
+            tenant_id=ctx.tenant_id,
+            actor_id=ctx.user_id,
+            event_type="chain.anchor.queue",
+            metadata={"job_id": job.job_id, "debate_id": payload.debate_id},
+        )
+        return {"queued": True, "duplicate": False, "job_id": job.job_id, "status": job.status}
+
     adapter = get_chain_adapter()
     anchor_result = adapter.anchor_decision(
         debate_id=payload.debate_id,
@@ -823,6 +1272,13 @@ def anchor_decision(
         resource=f"chain/tx/{row.tx_hash}",
         payload={"debate_id": payload.debate_id, "network": payload.network, "request_id": ctx.request_id},
     )
+    _record_usage_event(
+        db=db,
+        tenant_id=ctx.tenant_id,
+        actor_id=ctx.user_id,
+        event_type="chain.anchor.immediate",
+        metadata={"debate_id": payload.debate_id, "tx_hash": row.tx_hash},
+    )
     return {
         "anchor_id": row.anchor_id,
         "tx_hash": row.tx_hash,
@@ -831,6 +1287,36 @@ def anchor_decision(
         "network": row.network,
         "duplicate": False,
     }
+
+
+@app.get("/v1/chain/queue/status")
+def get_chain_queue_status(
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> dict:
+    require_roles(ctx, {"admin", "owner"})
+    return queue_status(db=db, tenant_id=ctx.tenant_id)
+
+
+@app.post("/v1/chain/queue/flush")
+def flush_chain_queue(
+    max_items: int = 20,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> dict:
+    require_roles(ctx, {"admin", "owner"})
+    if max_items < 1 or max_items > 200:
+        raise HTTPException(status_code=400, detail="max_items must be between 1 and 200")
+    result = process_anchor_jobs(db=db, max_items=max_items, tenant_id=ctx.tenant_id)
+    audit_store.append(
+        db=db,
+        tenant_id=ctx.tenant_id,
+        actor_id=ctx.user_id,
+        action="chain.queue.flush",
+        resource="chain/queue/flush",
+        payload={"max_items": max_items, "processed": result["processed"], "request_id": ctx.request_id},
+    )
+    return result
 
 
 @app.get("/v1/chain/tx/{tx_hash}")
@@ -875,6 +1361,27 @@ def approve_debate(
     return DebateApproveResponse(debate_id=debate_id, status=record.status)
 
 
+@app.post("/v1/debates/{debate_id}/reject", response_model=DebateApproveResponse)
+def reject_debate(
+    debate_id: str,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> DebateApproveResponse:
+    require_roles(ctx, {"admin", "owner"})
+    record = store.reject(db, debate_id, tenant_id=ctx.tenant_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Debate not found")
+    audit_store.append(
+        db=db,
+        tenant_id=ctx.tenant_id,
+        actor_id=ctx.user_id,
+        action="debate.reject",
+        resource=f"debates/{debate_id}",
+        payload={"status": record.status, "role": ctx.user_role, "request_id": ctx.request_id},
+    )
+    return DebateApproveResponse(debate_id=debate_id, status=record.status)
+
+
 @app.get("/v1/admin/audit")
 def get_audit_events(
     ctx: RequestContext = Depends(get_request_context),
@@ -884,6 +1391,71 @@ def get_audit_events(
     return [asdict(event) for event in audit_store.list_for_tenant(db, ctx.tenant_id)]
 
 
+@app.get("/v1/admin/audit/export")
+def export_audit_events(
+    format: str = "json",
+    since_hours: int = 24,
+    action_prefix: str | None = None,
+    limit: int = 1000,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+):
+    require_roles(ctx, {"admin", "owner"})
+    resolved_format = format.lower().strip()
+    if resolved_format not in {"json", "csv"}:
+        raise HTTPException(status_code=400, detail="format must be 'json' or 'csv'")
+    capped_since = max(1, min(since_hours, 24 * 90))
+    capped_limit = max(1, min(limit, 5000))
+    cutoff_ts = time.time() - (capped_since * 3600)
+    cutoff_iso = datetime.fromtimestamp(cutoff_ts, UTC).isoformat()
+
+    query = db.query(AuditEventModel).filter(
+        AuditEventModel.tenant_id == ctx.tenant_id,
+        AuditEventModel.timestamp >= cutoff_iso,
+    )
+    if action_prefix:
+        query = query.filter(AuditEventModel.action.like(f"{action_prefix}%"))
+    rows = query.order_by(AuditEventModel.id.asc()).limit(capped_limit).all()
+
+    payload = [
+        {
+            "timestamp": row.timestamp,
+            "tenant_id": row.tenant_id,
+            "actor_id": row.actor_id,
+            "action": row.action,
+            "resource": row.resource,
+            "payload": json.loads(row.payload_json),
+        }
+        for row in rows
+    ]
+    if resolved_format == "json":
+        return {
+            "tenant_id": ctx.tenant_id,
+            "since_hours": capped_since,
+            "count": len(payload),
+            "events": payload,
+        }
+
+    lines = ["timestamp,tenant_id,actor_id,action,resource,payload_json"]
+    for item in payload:
+        row_values = [
+            item["timestamp"],
+            item["tenant_id"],
+            item["actor_id"],
+            item["action"],
+            item["resource"],
+            json.dumps(item["payload"]).replace('"', '""'),
+        ]
+        escaped = [f"\"{value}\"" for value in row_values]
+        lines.append(",".join(escaped))
+    csv_body = "\n".join(lines)
+    return StreamingResponse(
+        iter([csv_body]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=audit_export.csv"},
+    )
+
+
 @app.get("/v1/admin/metrics")
 def get_metrics(ctx: RequestContext = Depends(get_request_context)) -> dict:
     require_roles(ctx, {"admin", "owner"})
@@ -891,6 +1463,157 @@ def get_metrics(ctx: RequestContext = Depends(get_request_context)) -> dict:
         "workflow": workflow_metrics_store.snapshot(),
         "endpoints": endpoint_metrics_store.snapshot(),
     }
+
+
+@app.get("/v1/admin/usage")
+def get_usage(
+    since_hours: int = 24,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> dict:
+    require_roles(ctx, {"admin", "owner"})
+    summary = _usage_summary(db=db, tenant_id=ctx.tenant_id, since_hours=since_hours)
+    rows = (
+        db.query(UsageEventModel)
+        .filter(UsageEventModel.tenant_id == ctx.tenant_id)
+        .order_by(UsageEventModel.id.desc())
+        .limit(200)
+        .all()
+    )
+    events = [
+        {
+            "id": row.id,
+            "event_type": row.event_type,
+            "quantity": row.quantity,
+            "unit": row.unit,
+            "actor_id": row.actor_id,
+            "metadata": json.loads(row.metadata_json),
+            "created_at": row.created_at,
+        }
+        for row in rows
+    ]
+    return {"summary": summary, "events": events}
+
+
+@app.get("/v1/admin/policy")
+def get_policy(ctx: RequestContext = Depends(get_request_context)) -> dict:
+    require_roles(ctx, {"admin", "owner"})
+    resolved = _resolve_plan_limits(ctx.tenant_id)
+    return {
+        "tenant_id": ctx.tenant_id,
+        "plan": resolved["plan"],
+        "window_hours": PLAN_LIMIT_WINDOW_HOURS,
+        "limits": resolved["limits"],
+    }
+
+
+@app.get("/v1/admin/api-keys")
+def list_api_keys(
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> dict:
+    require_roles(ctx, {"admin", "owner"})
+    rows = (
+        db.query(ApiKeyModel)
+        .filter(ApiKeyModel.tenant_id == ctx.tenant_id)
+        .order_by(ApiKeyModel.created_at.desc())
+        .all()
+    )
+    payload = [
+        {
+            "key_id": row.key_id,
+            "name": row.name,
+            "key_prefix": row.key_prefix,
+            "scopes": json.loads(row.scopes_json),
+            "status": row.status,
+            "created_by": row.created_by,
+            "created_at": row.created_at,
+            "revoked_at": row.revoked_at,
+        }
+        for row in rows
+    ]
+    return {"keys": payload}
+
+
+@app.post("/v1/admin/api-keys")
+def create_api_key(
+    payload: ApiKeyCreateRequest,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> dict:
+    require_roles(ctx, {"admin", "owner"})
+    key_id = str(uuid4())
+    raw_key = f"apk_{secrets.token_urlsafe(24)}"
+    key_hash = _hash_api_key(raw_key)
+    row = ApiKeyModel(
+        key_id=key_id,
+        tenant_id=ctx.tenant_id,
+        name=payload.name,
+        key_prefix=raw_key[:12],
+        key_hash=key_hash,
+        scopes_json=json.dumps(payload.scopes),
+        status="active",
+        created_by=ctx.user_id,
+        created_at=datetime.now(UTC).isoformat(),
+        revoked_at=None,
+    )
+    db.add(row)
+    db.commit()
+    audit_store.append(
+        db=db,
+        tenant_id=ctx.tenant_id,
+        actor_id=ctx.user_id,
+        action="api_key.create",
+        resource=f"api-keys/{key_id}",
+        payload={"name": payload.name, "request_id": ctx.request_id},
+    )
+    _record_usage_event(
+        db=db,
+        tenant_id=ctx.tenant_id,
+        actor_id=ctx.user_id,
+        event_type="api_key.create",
+        metadata={"key_id": key_id, "name": payload.name},
+    )
+    return {
+        "key": {
+            "key_id": row.key_id,
+            "name": row.name,
+            "key_prefix": row.key_prefix,
+            "scopes": payload.scopes,
+            "status": row.status,
+            "created_at": row.created_at,
+        },
+        "raw_key": raw_key,
+    }
+
+
+@app.post("/v1/admin/api-keys/{key_id}/revoke")
+def revoke_api_key(
+    key_id: str,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> dict:
+    require_roles(ctx, {"admin", "owner"})
+    row = (
+        db.query(ApiKeyModel)
+        .filter(ApiKeyModel.key_id == key_id, ApiKeyModel.tenant_id == ctx.tenant_id)
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="API key not found")
+    if row.status != "revoked":
+        row.status = "revoked"
+        row.revoked_at = datetime.now(UTC).isoformat()
+        db.commit()
+    audit_store.append(
+        db=db,
+        tenant_id=ctx.tenant_id,
+        actor_id=ctx.user_id,
+        action="api_key.revoke",
+        resource=f"api-keys/{key_id}",
+        payload={"request_id": ctx.request_id},
+    )
+    return {"key_id": key_id, "status": row.status, "revoked_at": row.revoked_at}
 
 
 @app.get("/v1/admin/slo")
@@ -1098,47 +1821,349 @@ async def slack_commands(request: Request, db: Session = Depends(get_db)) -> JSO
     team_id = form.get("team_id", "unknown-team")
     user_id = form.get("user_id", "unknown-user")
 
-    if command != "/debate":
-        return JSONResponse(status_code=200, content={"response_type": "ephemeral", "text": "Unsupported command."})
-    if not text:
-        return JSONResponse(
-            status_code=200,
-            content={"response_type": "ephemeral", "text": "Usage: /debate <proposal text>"},
-        )
-
     tenant_id = f"slack-{team_id}"
-    request_id = f"slack-cmd-{int(time.time() * 1000)}"
-    record, workflow_metrics = store.create(
-        db=db,
-        proposal=text,
-        tenant_id=tenant_id,
-        request_id=request_id,
-    )
-    workflow_metrics_store.record_workflow(workflow_metrics)
-    audit_store.append(
-        db=db,
-        tenant_id=tenant_id,
-        actor_id=f"slack-{user_id}",
-        action="slack.command.debate.create",
-        resource=f"debates/{record.debate_id}",
-        payload={"request_id": request_id, "source": "slack", "command": command},
-    )
-    channel_id = form.get("channel_id", "")
-    if channel_id:
-        slack_integration.queue_thread_message(
+    if command == "/debate":
+        if not text:
+            return JSONResponse(
+                status_code=200,
+                content={"response_type": "ephemeral", "text": "Usage: /debate <proposal text>"},
+            )
+        request_id = f"slack-cmd-{int(time.time() * 1000)}"
+        record, workflow_metrics = store.create(
+            db=db,
+            proposal=text,
+            tenant_id=tenant_id,
+            request_id=request_id,
+        )
+        workflow_metrics_store.record_workflow(workflow_metrics)
+        audit_store.append(
             db=db,
             tenant_id=tenant_id,
-            channel=channel_id,
-            text=f"Debate `{record.debate_id}` queued. Proposal: {record.proposal}",
-            dedupe_key=f"debate-created:{record.debate_id}",
+            actor_id=f"slack-{user_id}",
+            action="slack.command.debate.create",
+            resource=f"debates/{record.debate_id}",
+            payload={"request_id": request_id, "source": "slack", "command": command},
         )
-    return JSONResponse(
-        status_code=200,
-        content={
-            "response_type": "in_channel",
-            "text": f"Debate created: {record.debate_id} for proposal '{record.proposal}'",
-        },
-    )
+        channel_id = form.get("channel_id", "")
+        if channel_id:
+            slack_integration.queue_thread_message(
+                db=db,
+                tenant_id=tenant_id,
+                channel=channel_id,
+                text=f"Debate `{record.debate_id}` queued. Proposal: {record.proposal}",
+                dedupe_key=f"debate-created:{record.debate_id}",
+            )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "response_type": "in_channel",
+                "text": f"Debate created: {record.debate_id} for proposal '{record.proposal}'",
+                "blocks": [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"*Debate created:* `{record.debate_id}`\n{record.proposal}",
+                        },
+                    },
+                    {
+                        "type": "actions",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "style": "primary",
+                                "text": {"type": "plain_text", "text": "Approve"},
+                                "action_id": "debate_approve",
+                                "value": record.debate_id,
+                            },
+                            {
+                                "type": "button",
+                                "style": "danger",
+                                "text": {"type": "plain_text", "text": "Reject"},
+                                "action_id": "debate_reject",
+                                "value": record.debate_id,
+                            },
+                        ],
+                    },
+                ],
+            },
+        )
+
+    if command == "/federation":
+        parts = text.split()
+        if len(parts) != 2 or parts[0] not in {"create-session", "decision", "submissions"}:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "response_type": "ephemeral",
+                    "text": (
+                        "Usage: /federation create-session <federation_id> | "
+                        "/federation decision <session_id> | "
+                        "/federation submissions <session_id>"
+                    ),
+                },
+            )
+        if parts[0] == "create-session":
+            federation_id = parts[1]
+            federation = (
+                db.query(FederationModel)
+                .filter(FederationModel.federation_id == federation_id, FederationModel.tenant_id == tenant_id)
+                .first()
+            )
+            if federation is None:
+                return JSONResponse(
+                    status_code=200,
+                    content={"response_type": "ephemeral", "text": f"Federation `{federation_id}` not found."},
+                )
+            session_id = str(uuid4())
+            db.add(
+                FederationSessionModel(
+                    session_id=session_id,
+                    federation_id=federation_id,
+                    tenant_id=tenant_id,
+                    status="open",
+                    created_by=f"slack-{user_id}",
+                    created_at=datetime.now(UTC).isoformat(),
+                )
+            )
+            db.commit()
+            audit_store.append(
+                db=db,
+                tenant_id=tenant_id,
+                actor_id=f"slack-{user_id}",
+                action="slack.command.federation.session.create",
+                resource=f"federations/{federation_id}/sessions/{session_id}",
+                payload={"source": "slack", "command": command},
+            )
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "response_type": "in_channel",
+                    "text": f"Federation session created: {session_id}",
+                    "blocks": [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": f"*Federation session:* `{session_id}`\nSelect your parliament stance.",
+                            },
+                        },
+                        {
+                            "type": "actions",
+                            "elements": [
+                                {
+                                    "type": "button",
+                                    "style": "primary",
+                                    "text": {"type": "plain_text", "text": "Approve"},
+                                    "action_id": "federation_join_approved",
+                                    "value": session_id,
+                                },
+                                {
+                                    "type": "button",
+                                    "style": "danger",
+                                    "text": {"type": "plain_text", "text": "Reject"},
+                                    "action_id": "federation_join_rejected",
+                                    "value": session_id,
+                                },
+                                {
+                                    "type": "button",
+                                    "text": {"type": "plain_text", "text": "Inconclusive"},
+                                    "action_id": "federation_join_inconclusive",
+                                    "value": session_id,
+                                },
+                            ],
+                        },
+                    ],
+                },
+            )
+
+        session_id = parts[1]
+        if parts[0] == "decision":
+            result = _compute_federation_decision(session_id=session_id, tenant_id=tenant_id, db=db)
+            if result is None:
+                return JSONResponse(
+                    status_code=200,
+                    content={"response_type": "ephemeral", "text": f"Session `{session_id}` not found."},
+                )
+            audit_store.append(
+                db=db,
+                tenant_id=tenant_id,
+                actor_id=f"slack-{user_id}",
+                action="slack.command.federation.decision.read",
+                resource=f"federations/sessions/{session_id}/decision",
+                payload={"source": "slack", "command": command, "decision": result["decision"]},
+            )
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "response_type": "in_channel",
+                    "text": (
+                        f"Federation session `{session_id}` decision: {result['decision']} "
+                        f"(confidence={result['confidence']}, submissions={result['submissions']})"
+                    ),
+                },
+            )
+
+        submissions_result = _list_federation_submissions(session_id=session_id, tenant_id=tenant_id, db=db)
+        if submissions_result is None:
+            return JSONResponse(
+                status_code=200,
+                content={"response_type": "ephemeral", "text": f"Session `{session_id}` not found."},
+            )
+
+        submission_rows = submissions_result["submissions"]
+        if not submission_rows:
+            summary_text = f"Federation session `{session_id}` has no submissions yet."
+        else:
+            compact_lines = [
+                (
+                    f"{item['parliament_name']}: {item['position']} "
+                    f"(c={item['confidence']:.2f}, w={item['weight']:.2f})"
+                )
+                for item in submission_rows[:8]
+            ]
+            truncated_suffix = ""
+            if len(submission_rows) > 8:
+                truncated_suffix = f"\n...and {len(submission_rows) - 8} more."
+            summary_text = (
+                f"Federation session `{session_id}` submissions ({len(submission_rows)}):\n"
+                + "\n".join(compact_lines)
+                + truncated_suffix
+            )
+
+        audit_store.append(
+            db=db,
+            tenant_id=tenant_id,
+            actor_id=f"slack-{user_id}",
+            action="slack.command.federation.submissions.read",
+            resource=f"federations/sessions/{session_id}/submissions",
+            payload={"source": "slack", "command": command, "count": len(submission_rows)},
+        )
+        return JSONResponse(status_code=200, content={"response_type": "in_channel", "text": summary_text})
+
+    return JSONResponse(status_code=200, content={"response_type": "ephemeral", "text": "Unsupported command."})
+
+
+@app.post("/v1/integrations/slack/interactions")
+async def slack_interactions(request: Request, db: Session = Depends(get_db)) -> JSONResponse:
+    if not slack_integration.enabled():
+        return JSONResponse(status_code=503, content={"detail": "Slack integration disabled"})
+
+    body = await request.body()
+    signature = request.headers.get("X-Slack-Signature")
+    timestamp = request.headers.get("X-Slack-Request-Timestamp")
+    if not slack_integration.verify_signature(timestamp, signature, body):
+        return JSONResponse(status_code=401, content={"detail": "Invalid Slack signature"})
+
+    form = slack_integration.parse_form_body(body)
+    payload_raw = form.get("payload", "")
+    if not payload_raw:
+        return JSONResponse(status_code=400, content={"detail": "Missing payload"})
+    payload = json.loads(payload_raw)
+
+    payload_type = payload.get("type", "")
+    if payload_type != "block_actions":
+        return JSONResponse(status_code=200, content={"response_type": "ephemeral", "text": "Unsupported interaction type."})
+
+    team_id = payload.get("team", {}).get("id", "unknown-team")
+    actor_id = payload.get("user", {}).get("id", "unknown-user")
+    action = (payload.get("actions") or [{}])[0]
+    action_id = action.get("action_id", "")
+    debate_id = action.get("value", "")
+    tenant_id = f"slack-{team_id}"
+
+    if action_id in {"debate_approve", "debate_reject"}:
+        debate_id = action.get("value", "")
+        if not debate_id:
+            return JSONResponse(status_code=200, content={"response_type": "ephemeral", "text": "Missing debate id."})
+
+        if action_id == "debate_approve":
+            record = store.approve(db, debate_id, tenant_id=tenant_id)
+            status = "approved"
+            audit_action = "slack.interaction.debate.approve"
+        else:
+            record = store.reject(db, debate_id, tenant_id=tenant_id)
+            status = "rejected"
+            audit_action = "slack.interaction.debate.reject"
+
+        if record is None:
+            return JSONResponse(status_code=200, content={"response_type": "ephemeral", "text": f"Debate `{debate_id}` not found for this tenant."})
+
+        audit_store.append(
+            db=db,
+            tenant_id=tenant_id,
+            actor_id=f"slack-{actor_id}",
+            action=audit_action,
+            resource=f"debates/{debate_id}",
+            payload={"source": "slack", "action_id": action_id},
+        )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "response_type": "in_channel",
+                "replace_original": True,
+                "text": f"Debate `{debate_id}` {status} by <@{actor_id}>.",
+            },
+        )
+
+    federation_actions = {
+        "federation_join_approved": "APPROVED",
+        "federation_join_rejected": "REJECTED",
+        "federation_join_inconclusive": "INCONCLUSIVE",
+    }
+    if action_id in federation_actions:
+        session_id = action.get("value", "")
+        if not session_id:
+            return JSONResponse(status_code=200, content={"response_type": "ephemeral", "text": "Missing session id."})
+        session = (
+            db.query(FederationSessionModel)
+            .filter(FederationSessionModel.session_id == session_id, FederationSessionModel.tenant_id == tenant_id)
+            .first()
+        )
+        if session is None:
+            return JSONResponse(status_code=200, content={"response_type": "ephemeral", "text": f"Session `{session_id}` not found."})
+        if session.status != "open":
+            return JSONResponse(status_code=200, content={"response_type": "ephemeral", "text": f"Session `{session_id}` is closed."})
+
+        position = federation_actions[action_id]
+        db.add(
+            FederationSessionSubmissionModel(
+                session_id=session_id,
+                tenant_id=tenant_id,
+                parliament_name=f"Slack Delegate {actor_id}",
+                position=position,
+                confidence=0.75 if position != "INCONCLUSIVE" else 0.6,
+                summary="Submitted via Slack interactive action.",
+                weight=1.0,
+                submitted_by=f"slack-{actor_id}",
+                submitted_at=datetime.now(UTC).isoformat(),
+            )
+        )
+        db.commit()
+        audit_store.append(
+            db=db,
+            tenant_id=tenant_id,
+            actor_id=f"slack-{actor_id}",
+            action="slack.interaction.federation.join",
+            resource=f"federations/sessions/{session_id}",
+            payload={"source": "slack", "action_id": action_id, "position": position},
+        )
+        _queue_federation_slack_update(
+            db=db,
+            tenant_id=tenant_id,
+            text=f"[Federation:{session_id}] Slack Delegate {actor_id} submitted {position} via interactive action.",
+            dedupe_key=f"fed-session:{session_id}:slack-action:{actor_id}:{position}:{int(time.time())}",
+        )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "response_type": "in_channel",
+                "replace_original": False,
+                "text": f"Session `{session_id}` recorded `{position}` from <@{actor_id}>.",
+            },
+        )
+
+    return JSONResponse(status_code=200, content={"response_type": "ephemeral", "text": "Unsupported action."})
 
 
 @app.get("/v1/integrations/slack/outbound/status")

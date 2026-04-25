@@ -37,6 +37,37 @@ export type AgentRecord = {
   updated_at: string;
 };
 
+export type AgentOutcome = {
+  id: number;
+  debate_id: string;
+  outcome_score: number;
+  predicted_confidence: number;
+  actual_score: number;
+  notes: string;
+  created_by: string;
+  created_at: string;
+};
+
+export type AgentVersionRecord = {
+  id: number;
+  version: number;
+  traits: Record<string, unknown>;
+  calibration_score: number;
+  reason: string;
+  created_at: string;
+};
+
+export type AdminApiKeyRecord = {
+  key_id: string;
+  name: string;
+  key_prefix: string;
+  scopes: string[];
+  status: string;
+  created_by: string;
+  created_at: string;
+  revoked_at: string | null;
+};
+
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
 
 const DEFAULT_HEADERS = {
@@ -151,7 +182,23 @@ export async function getFederationDecision(sessionId: string): Promise<Record<s
   return response.json();
 }
 
-export async function anchorDecision(debateId: string, reportHash: string, network = "testnet"): Promise<ChainAnchorResult> {
+export async function getFederationSubmissions(sessionId: string): Promise<Record<string, unknown>> {
+  const response = await fetch(`${API_BASE_URL}/v1/federations/sessions/${sessionId}/submissions`, {
+    headers: { ...DEFAULT_HEADERS, "X-Request-Id": `web-fed-submissions-${Date.now()}` },
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to fetch federation submissions: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function anchorDecision(
+  debateId: string,
+  reportHash: string,
+  network = "testnet",
+  deferred = false
+): Promise<ChainAnchorResult | Record<string, unknown>> {
   const response = await fetch(`${API_BASE_URL}/v1/chain/anchor-decision`, {
     method: "POST",
     headers: {
@@ -159,11 +206,37 @@ export async function anchorDecision(debateId: string, reportHash: string, netwo
       ...DEFAULT_HEADERS,
       "X-Request-Id": `web-chain-anchor-${Date.now()}`,
     },
-    body: JSON.stringify({ debate_id: debateId, report_hash: reportHash, network }),
+    body: JSON.stringify({ debate_id: debateId, report_hash: reportHash, network, deferred }),
     cache: "no-store",
   });
   if (!response.ok) {
     throw new Error(`Failed to anchor decision: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function getChainQueueStatus(): Promise<Record<string, unknown>> {
+  const response = await fetch(`${API_BASE_URL}/v1/chain/queue/status`, {
+    headers: { ...DEFAULT_HEADERS, "X-Request-Id": `web-chain-queue-status-${Date.now()}` },
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to fetch chain queue status: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function flushChainQueue(maxItems = 20): Promise<Record<string, unknown>> {
+  const response = await fetch(`${API_BASE_URL}/v1/chain/queue/flush?max_items=${maxItems}`, {
+    method: "POST",
+    headers: {
+      ...DEFAULT_HEADERS,
+      "X-Request-Id": `web-chain-queue-flush-${Date.now()}`,
+    },
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to flush chain queue: ${response.status}`);
   }
   return response.json();
 }
@@ -286,6 +359,30 @@ export async function rollbackAgent(agentId: string, version: number): Promise<R
   return response.json();
 }
 
+export async function getAgentOutcomes(agentId: string, limit = 100): Promise<AgentOutcome[]> {
+  const response = await fetch(`${API_BASE_URL}/v1/agents/${agentId}/outcomes?limit=${limit}`, {
+    headers: { ...DEFAULT_HEADERS, "X-Request-Id": `web-agents-outcomes-${Date.now()}` },
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to fetch agent outcomes: ${response.status}`);
+  }
+  const payload = await response.json();
+  return payload.outcomes || [];
+}
+
+export async function getAgentVersions(agentId: string, limit = 100): Promise<AgentVersionRecord[]> {
+  const response = await fetch(`${API_BASE_URL}/v1/agents/${agentId}/versions?limit=${limit}`, {
+    headers: { ...DEFAULT_HEADERS, "X-Request-Id": `web-agents-versions-${Date.now()}` },
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to fetch agent versions: ${response.status}`);
+  }
+  const payload = await response.json();
+  return payload.versions || [];
+}
+
 export async function getAdminOverview(compact = true): Promise<Record<string, unknown>> {
   const query = compact ? "?compact=true" : "";
   const response = await fetch(`${API_BASE_URL}/v1/admin/overview${query}`, {
@@ -305,6 +402,72 @@ export async function getAdminSlo(): Promise<Record<string, unknown>> {
   });
   if (!response.ok) {
     throw new Error(`Failed to fetch admin SLO: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function getAdminUsage(sinceHours = 24): Promise<Record<string, unknown>> {
+  const response = await fetch(`${API_BASE_URL}/v1/admin/usage?since_hours=${sinceHours}`, {
+    headers: { ...DEFAULT_HEADERS, "X-Request-Id": `web-admin-usage-${Date.now()}` },
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to fetch admin usage: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function getAdminPolicy(): Promise<Record<string, unknown>> {
+  const response = await fetch(`${API_BASE_URL}/v1/admin/policy`, {
+    headers: { ...DEFAULT_HEADERS, "X-Request-Id": `web-admin-policy-${Date.now()}` },
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to fetch admin policy: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function listAdminApiKeys(): Promise<AdminApiKeyRecord[]> {
+  const response = await fetch(`${API_BASE_URL}/v1/admin/api-keys`, {
+    headers: { ...DEFAULT_HEADERS, "X-Request-Id": `web-admin-api-keys-list-${Date.now()}` },
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to list API keys: ${response.status}`);
+  }
+  const payload = await response.json();
+  return payload.keys || [];
+}
+
+export async function createAdminApiKey(name: string, scopes: string[]): Promise<Record<string, unknown>> {
+  const response = await fetch(`${API_BASE_URL}/v1/admin/api-keys`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...DEFAULT_HEADERS,
+      "X-Request-Id": `web-admin-api-keys-create-${Date.now()}`,
+    },
+    body: JSON.stringify({ name, scopes }),
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to create API key: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function revokeAdminApiKey(keyId: string): Promise<Record<string, unknown>> {
+  const response = await fetch(`${API_BASE_URL}/v1/admin/api-keys/${keyId}/revoke`, {
+    method: "POST",
+    headers: {
+      ...DEFAULT_HEADERS,
+      "X-Request-Id": `web-admin-api-keys-revoke-${Date.now()}`,
+    },
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to revoke API key: ${response.status}`);
   }
   return response.json();
 }

@@ -1,0 +1,62 @@
+name: canary-rollback-drill
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment name"
+        required: true
+        default: "staging"
+      canary_percent:
+        description: "Initial canary traffic percent"
+        required: true
+        default: "10"
+      rollback_on_failure:
+        description: "Auto-rollback when checks fail"
+        required: true
+        default: "true"
+
+jobs:
+  canary-drill:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r apps/api/requirements.txt
+
+      - name: Record drill metadata
+        run: |
+          echo "Environment: ${{ github.event.inputs.environment }}"
+          echo "Canary percent: ${{ github.event.inputs.canary_percent }}"
+          echo "Rollback on failure: ${{ github.event.inputs.rollback_on_failure }}"
+          echo "Drill run id: ${{ github.run_id }}"
+
+      - name: Canary safety gate - integration + security + load smoke
+        run: |
+          pytest tests/integration -q
+          pytest tests/integration/test_security_harness.py -q
+          pytest tests/nonfunctional -q
+
+      - name: Promote canary (simulated)
+        if: ${{ success() }}
+        run: |
+          echo "Simulated canary promotion to ${{ github.event.inputs.canary_percent }}% traffic."
+          echo "In production, replace with deployment command."
+
+      - name: Rollback (simulated)
+        if: ${{ failure() && github.event.inputs.rollback_on_failure == 'true' }}
+        run: |
+          echo "Simulated rollback triggered due to failed safety gate."
+          echo "In production, replace with rollback command."
+
+      - name: Upload drill summary
+        if: always()
+        run: |
+          echo "Canary rollback drill completed with status=${{ job.status }}"
