@@ -43,9 +43,16 @@ def test_debate_lifecycle() -> None:
         events_resp = client.get(f"/v1/debates/{debate_id}/events", headers=HEADERS)
         assert events_resp.status_code == 200
         events = events_resp.json()["events"]
-        assert len(events) >= 2
+        assert len(events) >= 7
         assert events[0]["event_type"] == "debate_created"
         assert events[0]["payload"]["request_id"] == "req-test-001"
+        event_types = [event["event_type"] for event in events]
+        assert "agent_context_loaded" in event_types
+        assert "initial_opinions_generated" in event_types
+        assert "debate_rounds_completed" in event_types
+        assert "evidence_scored" in event_types
+        assert "structured_votes_recorded" in event_types
+        assert "consensus_computed" in event_types
 
         approve_resp = client.post(f"/v1/debates/{debate_id}/approve", headers=HEADERS)
         assert approve_resp.status_code == 200
