@@ -225,3 +225,63 @@ export async function recalibrateAgent(agentId: string): Promise<AgentRecord> {
   }
   return response.json();
 }
+
+export async function getAdminOverview(compact = true): Promise<Record<string, unknown>> {
+  const query = compact ? "?compact=true" : "";
+  const response = await fetch(`${API_BASE_URL}/v1/admin/overview${query}`, {
+    headers: { ...DEFAULT_HEADERS, "X-Request-Id": `web-admin-overview-${Date.now()}` },
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to fetch admin overview: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function getAdminSlo(): Promise<Record<string, unknown>> {
+  const response = await fetch(`${API_BASE_URL}/v1/admin/slo`, {
+    headers: { ...DEFAULT_HEADERS, "X-Request-Id": `web-admin-slo-${Date.now()}` },
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to fetch admin SLO: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function getDependencyHealth(): Promise<Record<string, unknown>> {
+  const response = await fetch(`${API_BASE_URL}/v1/admin/health/dependencies`, {
+    headers: { ...DEFAULT_HEADERS, "X-Request-Id": `web-admin-health-${Date.now()}` },
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to fetch dependency health: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function getSlackOutboundStatus(): Promise<Record<string, unknown>> {
+  const response = await fetch(`${API_BASE_URL}/v1/integrations/slack/outbound/status`, {
+    headers: { ...DEFAULT_HEADERS, "X-Request-Id": `web-admin-slack-status-${Date.now()}` },
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to fetch outbound status: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function flushSlackOutbound(): Promise<Record<string, unknown>> {
+  const response = await fetch(`${API_BASE_URL}/v1/integrations/slack/outbound/flush`, {
+    method: "POST",
+    headers: {
+      ...DEFAULT_HEADERS,
+      "X-Request-Id": `web-admin-slack-flush-${Date.now()}`,
+    },
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to flush outbound queue: ${response.status}`);
+  }
+  return response.json();
+}

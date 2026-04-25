@@ -7,7 +7,12 @@ import {
   createDebate,
   createFederation,
   createFederationSession,
+  flushSlackOutbound,
+  getAdminOverview,
+  getAdminSlo,
+  getDependencyHealth,
   getFederationDecision,
+  getSlackOutboundStatus,
   getTxStatus,
   listAgents,
   patchAgent,
@@ -31,6 +36,7 @@ export default function DashboardPage() {
   const [agentId, setAgentId] = useState("agent-web-001");
   const [agentTraitsText, setAgentTraitsText] = useState('{"risk_tolerance": 0.4, "priority": "reliability"}');
   const [agentOutput, setAgentOutput] = useState<Record<string, unknown> | Array<Record<string, unknown>> | null>(null);
+  const [adminOutput, setAdminOutput] = useState<Record<string, unknown> | null>(null);
 
   async function onCreate() {
     try {
@@ -147,6 +153,56 @@ export default function DashboardPage() {
       setError("");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to recalibrate agent");
+    }
+  }
+
+  async function onAdminOverview() {
+    try {
+      const response = await getAdminOverview(true);
+      setAdminOutput(response);
+      setError("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to fetch admin overview");
+    }
+  }
+
+  async function onAdminSlo() {
+    try {
+      const response = await getAdminSlo();
+      setAdminOutput(response);
+      setError("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to fetch admin SLO");
+    }
+  }
+
+  async function onAdminDependencyHealth() {
+    try {
+      const response = await getDependencyHealth();
+      setAdminOutput(response);
+      setError("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to fetch dependency health");
+    }
+  }
+
+  async function onSlackQueueStatus() {
+    try {
+      const response = await getSlackOutboundStatus();
+      setAdminOutput(response);
+      setError("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to fetch queue status");
+    }
+  }
+
+  async function onSlackQueueFlush() {
+    try {
+      const response = await flushSlackOutbound();
+      setAdminOutput(response);
+      setError("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to flush queue");
     }
   }
 
@@ -301,6 +357,28 @@ export default function DashboardPage() {
       </section>
 
       <section className="card">
+        <h2 style={{ marginTop: 0 }}>Admin Ops Panel</h2>
+        <p className="muted">Run operational checks and queue actions for production readiness monitoring.</p>
+        <div style={{ marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <button className="button" style={{ width: "auto" }} onClick={onAdminOverview}>
+            Overview
+          </button>
+          <button className="button" style={{ width: "auto" }} onClick={onAdminSlo}>
+            SLO
+          </button>
+          <button className="button" style={{ width: "auto" }} onClick={onAdminDependencyHealth}>
+            Dependencies
+          </button>
+          <button className="button" style={{ width: "auto" }} onClick={onSlackQueueStatus}>
+            Queue Status
+          </button>
+          <button className="button" style={{ width: "auto" }} onClick={onSlackQueueFlush}>
+            Flush Queue
+          </button>
+        </div>
+      </section>
+
+      <section className="card">
         <h2 style={{ marginTop: 0 }}>Ops Output</h2>
         {federationOutput ? (
           <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontSize: 12 }}>{JSON.stringify(federationOutput, null, 2)}</pre>
@@ -311,8 +389,11 @@ export default function DashboardPage() {
         {agentOutput ? (
           <pre style={{ marginTop: 10, whiteSpace: "pre-wrap", fontSize: 12 }}>{JSON.stringify(agentOutput, null, 2)}</pre>
         ) : null}
-        {!federationOutput && !chainOutput && !agentOutput ? (
-          <p className="muted">No federation/chain/agent responses yet.</p>
+        {adminOutput ? (
+          <pre style={{ marginTop: 10, whiteSpace: "pre-wrap", fontSize: 12 }}>{JSON.stringify(adminOutput, null, 2)}</pre>
+        ) : null}
+        {!federationOutput && !chainOutput && !agentOutput && !adminOutput ? (
+          <p className="muted">No federation/chain/agent/admin responses yet.</p>
         ) : null}
         {error ? <p style={{ color: "#ff9ea8" }}>{error}</p> : null}
       </section>
