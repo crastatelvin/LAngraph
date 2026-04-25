@@ -17,6 +17,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from apps.api.audit import AuditStore
+from apps.api.chain import get_chain_adapter, refresh_tx_status
 from apps.api.context import RequestContext, get_request_context, require_roles
 from apps.api.db import Base, engine, get_db
 from apps.api.metrics import WorkflowMetricsStore
@@ -24,6 +25,7 @@ from apps.api.request_metrics import EndpointMetricsStore
 from apps.api.models import (
     AgentProfileModel,
     AgentProfileVersionModel,
+    ChainAnchorModel,
     DebateModel,
     FederationModel,
     FederationSessionModel,
@@ -98,6 +100,12 @@ class FederationJoinRequest(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     summary: str = Field(min_length=5, max_length=4000)
     weight: float = Field(default=1.0, ge=0.1, le=10.0)
+
+
+class AnchorDecisionRequest(BaseModel):
+    debate_id: str = Field(min_length=3, max_length=64)
+    report_hash: str = Field(min_length=16, max_length=128)
+    network: str = Field(default="testnet", min_length=3, max_length=64)
 
 
 def _queue_counts(db: Session, tenant_id: str | None = None) -> tuple[int, int]:
@@ -546,6 +554,88 @@ def federation_session_decision(
         "submissions": len(submissions),
         "dissenting_parliaments": dissent,
     }
+
+
+@app.post("/v1/chain/anchor-decision")
+def anchor_decision(
+    payload: AnchorDecisionRequest,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> dict:
+    require_roles(ctx, {"admin", "owner"})
+    adapter = get_chain_adapter()
+    anchor_result = adapter.anchor_decision(
+        debate_id=payload.debate_id,
+        report_hash=payload.report_hash,
+        network=payload.network,
+    )
+    existing = (
+        db.query(ChainAnchorModel)
+        .filter(ChainAnchorModel.tenant_id == ctx.tenant_id, ChainAnchorModel.tx_hash == anchor_result["tx_hash"])
+        .first()
+    )
+    if existing is not None:
+        return {
+            "anchor_id": existing.anchor_id,
+            "tx_hash": existing.tx_hash,
+            "status": existing.status,
+            "provider": existing.provider,
+            "network": existing.network,
+            "duplicate": True,
+        }
+    now_iso = datetime.now(UTC).isoformat()
+    row = ChainAnchorModel(
+        anchor_id=str(uuid4()),
+        tenant_id=ctx.tenant_id,
+        debate_id=payload.debate_id,
+        report_hash=payload.report_hash,
+        tx_hash=anchor_result["tx_hash"],
+        provider=anchor_result["provider"],
+        network=anchor_result["network"],
+        status="submitted",
+        submitted_by=ctx.user_id,
+        created_at=now_iso,
+        updated_at=now_iso,
+    )
+    db.add(row)
+    db.commit()
+    audit_store.append(
+        db=db,
+        tenant_id=ctx.tenant_id,
+        actor_id=ctx.user_id,
+        action="chain.anchor.create",
+        resource=f"chain/tx/{row.tx_hash}",
+        payload={"debate_id": payload.debate_id, "network": payload.network, "request_id": ctx.request_id},
+    )
+    return {
+        "anchor_id": row.anchor_id,
+        "tx_hash": row.tx_hash,
+        "status": row.status,
+        "provider": row.provider,
+        "network": row.network,
+        "duplicate": False,
+    }
+
+
+@app.get("/v1/chain/tx/{tx_hash}")
+def get_chain_tx(
+    tx_hash: str,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> dict:
+    require_roles(ctx, {"admin", "owner"})
+    refreshed = refresh_tx_status(db=db, tenant_id=ctx.tenant_id, tx_hash=tx_hash)
+    if refreshed is None:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    audit_store.append(
+        db=db,
+        tenant_id=ctx.tenant_id,
+        actor_id=ctx.user_id,
+        action="chain.tx.read",
+        resource=f"chain/tx/{tx_hash}",
+        payload={"request_id": ctx.request_id, "status": refreshed["status"]},
+    )
+    return refreshed
 
 
 @app.post("/v1/debates/{debate_id}/approve", response_model=DebateApproveResponse)

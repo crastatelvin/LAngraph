@@ -131,3 +131,19 @@ class FederationSessionSubmissionModel(Base):
     submitted_by: Mapped[str] = mapped_column(String(128))
     submitted_at: Mapped[str] = mapped_column(String(64))
 
+
+class ChainAnchorModel(Base):
+    __tablename__ = "chain_anchors"
+
+    anchor_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    debate_id: Mapped[str] = mapped_column(String(64), index=True)
+    report_hash: Mapped[str] = mapped_column(String(128), index=True)
+    tx_hash: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    provider: Mapped[str] = mapped_column(String(64))
+    network: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(32), default="submitted", index=True)
+    submitted_by: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[str] = mapped_column(String(64))
+    updated_at: Mapped[str] = mapped_column(String(64))
+
