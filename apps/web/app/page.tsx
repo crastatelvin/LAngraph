@@ -9,6 +9,9 @@ import {
   createFederationSession,
   getFederationDecision,
   getTxStatus,
+  listAgents,
+  patchAgent,
+  recalibrateAgent,
   joinFederationSession,
 } from "../lib/api";
 
@@ -25,6 +28,9 @@ export default function DashboardPage() {
   const [reportHash, setReportHash] = useState("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
   const [txHash, setTxHash] = useState("");
   const [chainOutput, setChainOutput] = useState<Record<string, unknown> | null>(null);
+  const [agentId, setAgentId] = useState("agent-web-001");
+  const [agentTraitsText, setAgentTraitsText] = useState('{"risk_tolerance": 0.4, "priority": "reliability"}');
+  const [agentOutput, setAgentOutput] = useState<Record<string, unknown> | Array<Record<string, unknown>> | null>(null);
 
   async function onCreate() {
     try {
@@ -110,6 +116,37 @@ export default function DashboardPage() {
       setError("");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to fetch tx status");
+    }
+  }
+
+  async function onListAgents() {
+    try {
+      const response = await listAgents();
+      setAgentOutput(response);
+      setError("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to list agents");
+    }
+  }
+
+  async function onPatchAgent() {
+    try {
+      const traits = JSON.parse(agentTraitsText) as Record<string, unknown>;
+      const response = await patchAgent(agentId, traits, "web_control_room_update");
+      setAgentOutput(response);
+      setError("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to patch agent");
+    }
+  }
+
+  async function onRecalibrateAgent() {
+    try {
+      const response = await recalibrateAgent(agentId);
+      setAgentOutput(response);
+      setError("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to recalibrate agent");
     }
   }
 
@@ -234,6 +271,36 @@ export default function DashboardPage() {
       </div>
 
       <section className="card">
+        <h2 style={{ marginTop: 0 }}>Agents Panel</h2>
+        <p className="muted">List tenant agents, patch traits, and trigger calibration updates.</p>
+        <input
+          className="input"
+          value={agentId}
+          onChange={(event) => setAgentId(event.target.value)}
+          placeholder="Agent ID"
+        />
+        <textarea
+          className="textarea"
+          style={{ marginTop: 8 }}
+          rows={4}
+          value={agentTraitsText}
+          onChange={(event) => setAgentTraitsText(event.target.value)}
+          placeholder='{"risk_tolerance": 0.4}'
+        />
+        <div style={{ marginTop: 8, display: "flex", gap: 8 }}>
+          <button className="button" onClick={onListAgents}>
+            List Agents
+          </button>
+          <button className="button" onClick={onPatchAgent} disabled={!agentId}>
+            Patch Agent
+          </button>
+          <button className="button" onClick={onRecalibrateAgent} disabled={!agentId}>
+            Recalibrate
+          </button>
+        </div>
+      </section>
+
+      <section className="card">
         <h2 style={{ marginTop: 0 }}>Ops Output</h2>
         {federationOutput ? (
           <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontSize: 12 }}>{JSON.stringify(federationOutput, null, 2)}</pre>
@@ -241,7 +308,12 @@ export default function DashboardPage() {
         {chainOutput ? (
           <pre style={{ marginTop: 10, whiteSpace: "pre-wrap", fontSize: 12 }}>{JSON.stringify(chainOutput, null, 2)}</pre>
         ) : null}
-        {!federationOutput && !chainOutput ? <p className="muted">No federation/chain responses yet.</p> : null}
+        {agentOutput ? (
+          <pre style={{ marginTop: 10, whiteSpace: "pre-wrap", fontSize: 12 }}>{JSON.stringify(agentOutput, null, 2)}</pre>
+        ) : null}
+        {!federationOutput && !chainOutput && !agentOutput ? (
+          <p className="muted">No federation/chain/agent responses yet.</p>
+        ) : null}
         {error ? <p style={{ color: "#ff9ea8" }}>{error}</p> : null}
       </section>
     </div>

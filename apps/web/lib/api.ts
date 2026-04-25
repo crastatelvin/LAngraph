@@ -25,6 +25,18 @@ export type ChainAnchorResult = {
   duplicate: boolean;
 };
 
+export type AgentRecord = {
+  agent_id: string;
+  tenant_id: string;
+  user_id: string;
+  name: string;
+  role: string;
+  traits: Record<string, unknown>;
+  calibration_score: number;
+  version: number;
+  updated_at: string;
+};
+
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
 
 const DEFAULT_HEADERS = {
@@ -163,6 +175,53 @@ export async function getTxStatus(txHash: string): Promise<Record<string, unknow
   });
   if (!response.ok) {
     throw new Error(`Failed to fetch tx status: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function listAgents(): Promise<AgentRecord[]> {
+  const response = await fetch(`${API_BASE_URL}/v1/agents`, {
+    headers: { ...DEFAULT_HEADERS, "X-Request-Id": `web-agents-list-${Date.now()}` },
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to list agents: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function patchAgent(
+  agentId: string,
+  traits: Record<string, unknown>,
+  reason = "web_update"
+): Promise<AgentRecord> {
+  const response = await fetch(`${API_BASE_URL}/v1/agents/${agentId}`, {
+    method: "PATCH",
+    headers: {
+      "content-type": "application/json",
+      ...DEFAULT_HEADERS,
+      "X-Request-Id": `web-agents-patch-${Date.now()}`,
+    },
+    body: JSON.stringify({ traits, reason }),
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to patch agent: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function recalibrateAgent(agentId: string): Promise<AgentRecord> {
+  const response = await fetch(`${API_BASE_URL}/v1/agents/${agentId}/recalibrate`, {
+    method: "POST",
+    headers: {
+      ...DEFAULT_HEADERS,
+      "X-Request-Id": `web-agents-recal-${Date.now()}`,
+    },
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to recalibrate agent: ${response.status}`);
   }
   return response.json();
 }
