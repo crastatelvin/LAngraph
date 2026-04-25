@@ -4,6 +4,27 @@ export type DebateItem = {
   status: string;
 };
 
+export type FederationCreateResult = {
+  federation_id: string;
+  name: string;
+  status: string;
+};
+
+export type FederationSessionResult = {
+  session_id: string;
+  federation_id: string;
+  status: string;
+};
+
+export type ChainAnchorResult = {
+  anchor_id: string;
+  tx_hash: string;
+  status: string;
+  provider: string;
+  network: string;
+  duplicate: boolean;
+};
+
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
 
 const DEFAULT_HEADERS = {
@@ -51,4 +72,97 @@ export async function getDebateEvents(debateId: string): Promise<Array<{ seq: nu
   }
   const payload = await response.json();
   return payload.events || [];
+}
+
+export async function createFederation(name: string): Promise<FederationCreateResult> {
+  const response = await fetch(`${API_BASE_URL}/v1/federations`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...DEFAULT_HEADERS,
+      "X-Request-Id": `web-fed-create-${Date.now()}`,
+    },
+    body: JSON.stringify({ name }),
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to create federation: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function createFederationSession(federationId: string, mode: string): Promise<FederationSessionResult> {
+  const response = await fetch(`${API_BASE_URL}/v1/federations/${federationId}/sessions`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...DEFAULT_HEADERS,
+      "X-Request-Id": `web-fed-session-${Date.now()}`,
+    },
+    body: JSON.stringify({ mode }),
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to create federation session: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function joinFederationSession(
+  sessionId: string,
+  payload: { parliament_name: string; position: "APPROVED" | "REJECTED" | "INCONCLUSIVE"; confidence: number; summary: string; weight: number }
+): Promise<{ session_id: string; joined: boolean; parliament_name: string }> {
+  const response = await fetch(`${API_BASE_URL}/v1/federations/sessions/${sessionId}/join`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...DEFAULT_HEADERS,
+      "X-Request-Id": `web-fed-join-${Date.now()}`,
+    },
+    body: JSON.stringify(payload),
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to join federation session: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function getFederationDecision(sessionId: string): Promise<Record<string, unknown>> {
+  const response = await fetch(`${API_BASE_URL}/v1/federations/sessions/${sessionId}/decision`, {
+    headers: { ...DEFAULT_HEADERS, "X-Request-Id": `web-fed-decision-${Date.now()}` },
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to fetch federation decision: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function anchorDecision(debateId: string, reportHash: string, network = "testnet"): Promise<ChainAnchorResult> {
+  const response = await fetch(`${API_BASE_URL}/v1/chain/anchor-decision`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...DEFAULT_HEADERS,
+      "X-Request-Id": `web-chain-anchor-${Date.now()}`,
+    },
+    body: JSON.stringify({ debate_id: debateId, report_hash: reportHash, network }),
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to anchor decision: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function getTxStatus(txHash: string): Promise<Record<string, unknown>> {
+  const response = await fetch(`${API_BASE_URL}/v1/chain/tx/${txHash}`, {
+    headers: { ...DEFAULT_HEADERS, "X-Request-Id": `web-chain-status-${Date.now()}` },
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to fetch tx status: ${response.status}`);
+  }
+  return response.json();
 }
