@@ -4,12 +4,14 @@ import json
 import logging
 import os
 import time
+from datetime import UTC, datetime
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse
 from opentelemetry import trace
+from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -18,7 +20,12 @@ from apps.api.context import RequestContext, get_request_context, require_roles
 from apps.api.db import Base, engine, get_db
 from apps.api.metrics import WorkflowMetricsStore
 from apps.api.request_metrics import EndpointMetricsStore
-from apps.api.models import DebateModel, SlackOutboundMessageModel
+from apps.api.models import (
+    AgentProfileModel,
+    AgentProfileVersionModel,
+    DebateModel,
+    SlackOutboundMessageModel,
+)
 from apps.api.store import DebateStore
 from apps.api.slack import SlackIntegration
 from apps.api.telemetry import setup_telemetry
@@ -56,6 +63,23 @@ SECURITY_HEADERS = {
 }
 
 
+class AgentRecord(BaseModel):
+    agent_id: str
+    tenant_id: str
+    user_id: str
+    name: str
+    role: str
+    traits: dict
+    calibration_score: float
+    version: int
+    updated_at: str
+
+
+class AgentPatchRequest(BaseModel):
+    traits: dict = Field(default_factory=dict)
+    reason: str = Field(default="manual_update", min_length=3, max_length=256)
+
+
 def _queue_counts(db: Session, tenant_id: str | None = None) -> tuple[int, int]:
     queued_query = db.query(SlackOutboundMessageModel).filter(
         SlackOutboundMessageModel.status.in_(["queued", "retry"])
@@ -76,6 +100,20 @@ def _slack_tenant_from_payload(payload: dict) -> str:
     if not resolved:
         return "slack-unknown-team"
     return f"slack-{resolved}"
+
+
+def _to_agent_record(row: AgentProfileModel) -> AgentRecord:
+    return AgentRecord(
+        agent_id=row.agent_id,
+        tenant_id=row.tenant_id,
+        user_id=row.user_id,
+        name=row.name,
+        role=row.role,
+        traits=json.loads(row.traits_json),
+        calibration_score=round(float(row.calibration_score), 4),
+        version=row.version,
+        updated_at=row.updated_at,
+    )
 
 
 @app.middleware("http")
@@ -196,6 +234,128 @@ def get_debate_events(
         payload={"role": ctx.user_role, "request_id": ctx.request_id},
     )
     return DebateEventsResponse(debate_id=debate_id, events=events)
+
+
+@app.get("/v1/agents")
+def list_agents(
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    rows = (
+        db.query(AgentProfileModel)
+        .filter(AgentProfileModel.tenant_id == ctx.tenant_id)
+        .order_by(AgentProfileModel.updated_at.desc())
+        .all()
+    )
+    audit_store.append(
+        db=db,
+        tenant_id=ctx.tenant_id,
+        actor_id=ctx.user_id,
+        action="agents.list",
+        resource="agents",
+        payload={"count": len(rows), "request_id": ctx.request_id, "role": ctx.user_role},
+    )
+    return [_to_agent_record(row).model_dump() for row in rows]
+
+
+@app.patch("/v1/agents/{agent_id}")
+def patch_agent(
+    agent_id: str,
+    payload: AgentPatchRequest,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> dict:
+    require_roles(ctx, {"admin", "owner"})
+    row = (
+        db.query(AgentProfileModel)
+        .filter(AgentProfileModel.agent_id == agent_id, AgentProfileModel.tenant_id == ctx.tenant_id)
+        .first()
+    )
+    if row is None:
+        row = AgentProfileModel(
+            agent_id=agent_id,
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            name=f"Agent {agent_id[:8]}",
+            role="representative",
+            traits_json=json.dumps(payload.traits),
+            calibration_score=0.5,
+            version=1,
+            updated_at=datetime.now(UTC).isoformat(),
+        )
+        db.add(row)
+    else:
+        previous_traits = row.traits_json
+        previous_calibration = row.calibration_score
+        db.add(
+            AgentProfileVersionModel(
+                agent_id=row.agent_id,
+                tenant_id=row.tenant_id,
+                version=row.version,
+                traits_json=previous_traits,
+                calibration_score=previous_calibration,
+                reason=payload.reason,
+                created_at=datetime.now(UTC).isoformat(),
+            )
+        )
+        row.version += 1
+        row.traits_json = json.dumps(payload.traits)
+        row.updated_at = datetime.now(UTC).isoformat()
+
+    db.commit()
+    db.refresh(row)
+    audit_store.append(
+        db=db,
+        tenant_id=ctx.tenant_id,
+        actor_id=ctx.user_id,
+        action="agent.patch",
+        resource=f"agents/{agent_id}",
+        payload={"version": row.version, "reason": payload.reason, "request_id": ctx.request_id},
+    )
+    return _to_agent_record(row).model_dump()
+
+
+@app.post("/v1/agents/{agent_id}/recalibrate")
+def recalibrate_agent(
+    agent_id: str,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+) -> dict:
+    require_roles(ctx, {"admin", "owner"})
+    row = (
+        db.query(AgentProfileModel)
+        .filter(AgentProfileModel.agent_id == agent_id, AgentProfileModel.tenant_id == ctx.tenant_id)
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    db.add(
+        AgentProfileVersionModel(
+            agent_id=row.agent_id,
+            tenant_id=row.tenant_id,
+            version=row.version,
+            traits_json=row.traits_json,
+            calibration_score=row.calibration_score,
+            reason="recalibration",
+            created_at=datetime.now(UTC).isoformat(),
+        )
+    )
+    # Simple bounded calibration update until full evaluator pipeline is added.
+    row.version += 1
+    row.calibration_score = round(min(0.95, row.calibration_score + 0.05), 4)
+    row.updated_at = datetime.now(UTC).isoformat()
+    db.commit()
+    db.refresh(row)
+    audit_store.append(
+        db=db,
+        tenant_id=ctx.tenant_id,
+        actor_id=ctx.user_id,
+        action="agent.recalibrate",
+        resource=f"agents/{agent_id}",
+        payload={"version": row.version, "request_id": ctx.request_id},
+    )
+    return _to_agent_record(row).model_dump()
 
 
 @app.post("/v1/debates/{debate_id}/approve", response_model=DebateApproveResponse)

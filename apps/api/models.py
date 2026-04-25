@@ -1,4 +1,4 @@
-from sqlalchemy import Integer, String, Text
+from sqlalchemy import Float, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from apps.api.db import Base
@@ -65,5 +65,32 @@ class SlackOutboundMessageModel(Base):
     dedupe_key: Mapped[str] = mapped_column(String(256), nullable=True, index=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    created_at: Mapped[str] = mapped_column(String(64))
+
+
+class AgentProfileModel(Base):
+    __tablename__ = "agent_profiles"
+
+    agent_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    user_id: Mapped[str] = mapped_column(String(128), index=True)
+    name: Mapped[str] = mapped_column(String(128))
+    role: Mapped[str] = mapped_column(String(64))
+    traits_json: Mapped[str] = mapped_column(Text())
+    calibration_score: Mapped[float] = mapped_column(Float(), default=0.5)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    updated_at: Mapped[str] = mapped_column(String(64))
+
+
+class AgentProfileVersionModel(Base):
+    __tablename__ = "agent_profile_versions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    agent_id: Mapped[str] = mapped_column(String(64), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    traits_json: Mapped[str] = mapped_column(Text())
+    calibration_score: Mapped[float] = mapped_column(Float(), default=0.5)
+    reason: Mapped[str] = mapped_column(String(256))
     created_at: Mapped[str] = mapped_column(String(64))
 
